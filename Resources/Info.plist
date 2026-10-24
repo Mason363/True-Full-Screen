@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>4.0.0</string>
+	<string>4.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>4</string>
+	<string>5</string>
 	<!-- Declaring this skips a ~40 MB LaunchServices lookup at launch. -->
 	<key>GPUSelectionPolicy</key>
 	<string>avoidRemovable</string>

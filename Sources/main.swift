@@ -53,15 +53,10 @@ private func setFullScreen(_ window: AXUIElement, _ on: Bool) {
 
 /// Moves a window and makes sure it stays there, since a window still animating can snap back.
 private func place(_ window: AXUIElement, at point: CGPoint) async {
-    var settled = 0
-    for _ in 0..<30 where settled < 2 {
-        if let origin = frame(of: window)?.origin, abs(origin.x - point.x) < 2, abs(origin.y - point.y) < 2 {
-            settled += 1
-        } else {
-            settled = 0
-            move(window, to: point)
-        }
-        try? await Task.sleep(for: .milliseconds(80))
+    for _ in 0..<25 {
+        move(window, to: point)
+        try? await Task.sleep(for: .milliseconds(40))
+        if let origin = frame(of: window)?.origin, abs(origin.x - point.x) < 2, abs(origin.y - point.y) < 2 { return }
     }
 }
 
@@ -278,7 +273,7 @@ final class Overlay {
         guard isShown else { return }
         isShown = false
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.2
+            context.duration = 0.15
             windows.forEach { $0.animator().alphaValue = 0 }
         }, completionHandler: { [weak self] in
             MainActor.assumeIsolated {
@@ -319,7 +314,10 @@ final class Stage: NSObject, SCStreamOutput {
     private var fence: CFMachPort?
     private var backdrop: NSWindow?
     private var wallpapers = 0
+    /// Whether the pointer belongs on the stage (true) or must stay off it (false).
     private var confined = false
+    private var quietUntil = Date.distantPast
+    private let others: [CGRect]
 
     static func open(on screen: NSScreen, overlay: Overlay) async -> Stage? {
         guard let mode = CGDisplayCopyDisplayMode(screen.displayID) else { return nil }
@@ -400,6 +398,20 @@ final class Stage: NSObject, SCStreamOutput {
         guard (try? stream.addStreamOutput(stage, type: .screen, sampleHandlerQueue: .main)) != nil,
               (try? await stream.startCapture()) != nil else { return nil }
         stage.stream = stream
+        // macOS marks every display while it's being captured. The panel shows its own mark, so
+        // leave the stage's out of the picture rather than show two.
+        let bounds = stage.bounds
+        Task { [weak stage] in
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let stream = stage?.stream else { return }
+                let windows = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true).windows
+                let marks = windows?.filter { $0.title == "StatusIndicator" && $0.frame.intersects(bounds) } ?? []
+                guard !marks.isEmpty else { continue }
+                try? await stream.updateContentFilter(SCContentFilter(display: target, excludingWindows: marks))
+                return
+            }
+        }
         return stage
     }
 
@@ -409,15 +421,13 @@ final class Stage: NSObject, SCStreamOutput {
         self.overlay = overlay
         id = display.displayID
         bounds = CGDisplayBounds(display.displayID)
+        others = NSScreen.screens.map { CGDisplayBounds($0.displayID) }.filter { $0 != CGDisplayBounds(display.displayID) }
         super.init()
         let moves: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         fence = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
                                   eventsOfInterest: moves.reduce(0) { $0 | 1 << $1.rawValue },
                                   callback: fenceCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
-        if let fence {
-            CGEvent.tapEnable(tap: fence, enable: false)
-            CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, fence, 0), .commonModes)
-        }
+        if let fence { CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, fence, 0), .commonModes) }
     }
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -462,23 +472,40 @@ final class Stage: NSObject, SCStreamOutput {
 
     /// Moves the pointer onto the display and keeps it there, or back to the same spot on the panel.
     func hold(pointer on: Bool) {
-        // Events already on their way still reach the fence, so it has to know to stand down.
         confined = on
-        if let fence { CGEvent.tapEnable(tap: fence, enable: on) }
         let point = pointer()
         if on, !bounds.contains(point) {
-            warp(panel.contains(point) ? point - panel.origin + bounds.origin : CGPoint(x: bounds.midX, y: bounds.midY))
+            move(to: panel.contains(point) ? point - panel.origin + bounds.origin : CGPoint(x: bounds.midX, y: bounds.midY))
         } else if !on, bounds.contains(point) {
-            warp(point - bounds.origin + panel.origin)
+            move(to: point - bounds.origin + panel.origin)
         }
     }
 
+    private func move(to point: CGPoint) {
+        warp(point)
+        // Events from before the move still carry the old spot.
+        quietUntil = Date().addingTimeInterval(0.08)
+    }
+
+    /// The stage touches the other displays at a corner, which the pointer could slip through:
+    /// keep it on the stage while it's in front, and off it otherwise.
     fileprivate func keep(_ point: CGPoint) {
-        guard confined, !bounds.contains(point) else { return }
-        let edge = CGPoint(x: min(max(point.x, bounds.minX), bounds.maxX - 1), y: min(max(point.y, bounds.minY), bounds.maxY - 1))
-        // Events from just before the pointer moved over still carry its spot on the panel.
-        let stale = panel.contains(point) && hypot(point.x - edge.x, point.y - edge.y) > 8
-        warp(stale ? point - panel.origin + bounds.origin : edge)
+        guard Date() >= quietUntil else { return }
+        if confined, !bounds.contains(point) {
+            move(to: clamp(point, into: bounds))
+        } else if !confined, bounds.contains(point) {
+            let display = others.min { distance(point, to: $0) < distance(point, to: $1) } ?? panel
+            move(to: clamp(point, into: display))
+        }
+    }
+
+    private func clamp(_ point: CGPoint, into rect: CGRect) -> CGPoint {
+        CGPoint(x: min(max(point.x, rect.minX), rect.maxX - 1), y: min(max(point.y, rect.minY), rect.maxY - 1))
+    }
+
+    private func distance(_ point: CGPoint, to rect: CGRect) -> CGFloat {
+        let near = clamp(point, into: rect)
+        return hypot(point.x - near.x, point.y - near.y)
     }
 
     /// Whether the app has a window showing on the display.
@@ -494,6 +521,7 @@ final class Stage: NSObject, SCStreamOutput {
     func close() {
         hold(pointer: false)
         if let fence { CFMachPortInvalidate(fence) }
+        fence = nil
         try? stream?.removeStreamOutput(self, type: .screen)
         stream?.stopCapture()
         stream = nil
@@ -524,7 +552,7 @@ private typealias NotifyProc = @convention(c) (UInt32, UnsafeMutableRawPointer?,
 private let windowServerEvent: NotifyProc = { _, _, _, info in
     guard let info else { return }
     let controller = Unmanaged<Controller>.fromOpaque(info).takeUnretainedValue()
-    DispatchQueue.main.async { MainActor.assumeIsolated { controller.exposeActive() } }
+    DispatchQueue.main.async { MainActor.assumeIsolated { controller.windowsChanged() } }
 }
 
 // MARK: - Menu bar glyph
@@ -582,7 +610,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tap: CFMachPort?
     private var swallowMouseUp = false
     private var missionControl = false
-    private var lastExposeCheck = Date.distantPast
+    private var checking = false
     private var missionControlTimer: Timer?
     /// Where windows were when their app quit in full screen, by bundle ID, to put them back on relaunch.
     private var homes: [String: CGRect] = [:]
@@ -851,7 +879,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Brings a window back to the panel once it has left full screen on the stage.
     private func bringHome(_ target: Target) async {
         // Let the way out play on screen, then swap in the real window underneath the last frame.
-        await stage?.settle(atLeast: .milliseconds(100), atMost: .milliseconds(1000))
+        await stage?.settle(atLeast: .zero, atMost: .milliseconds(600))
         overlay?.hold()
         await place(target.window, at: target.home.origin)
         targets.removeAll { CFEqual($0.window, target.window) }
@@ -929,6 +957,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         targets.removeAll { frame(of: $0.window) == nil }
         for index in targets.indices where !targets[index].leaving && !isFullScreen(targets[index].window) {
             targets[index].leaving = true
+            stage?.hold(pointer: false)
             let target = targets[index]
             Task { await bringHome(target) }
         }
@@ -943,19 +972,34 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sweep(stage)
         if targets.isEmpty { return close(stage) }
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let show = !missionControl && targets.contains { $0.pid == front } && front.map(stage.isShowing) == true
+        let show = !missionControl && targets.contains { $0.pid == front && !$0.leaving } && front.map(stage.isShowing) == true
         if show, overlay?.isShown == false { refreshBackdrop() }
-        if show { overlay?.fadeIn() } else { overlay?.fadeOut() }
+        if show {
+            overlay?.fadeIn()
+        } else if !targets.contains(where: \.leaving) {
+            // A window on its way out keeps its last frame up until it's back in place.
+            overlay?.fadeOut()
+        }
+        // The pointer is free the moment full screen ends.
         stage.hold(pointer: show)
     }
 
     // MARK: Mission Control
 
     /// Mission Control shows the panel's own Spaces, so step aside while it's open.
-    fileprivate func exposeActive() {
-        guard stage != nil, !missionControl, Date().timeIntervalSince(lastExposeCheck) > 0.2 else { return }
-        lastExposeCheck = Date()
-        guard missionControlIsOpen() else { return }
+    fileprivate func windowsChanged() {
+        // Only while a true full screen app is in view; otherwise nothing here gets in the way.
+        guard !checking, !missionControl, !closing, overlay?.isShown == true, stage != nil else { return }
+        // One look per burst of window changes.
+        checking = true
+        DispatchQueue.main.async { [self] in
+            checking = false
+            guard !missionControl, overlay?.isShown == true, missionControlIsOpen() else { return }
+            missionControlOpened()
+        }
+    }
+
+    private func missionControlOpened() {
         missionControl = true
         overlay?.hideNow()
         stage?.hold(pointer: false)

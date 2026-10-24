@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 APP="build/True Full Screen.app"
 rm -rf build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -Osize -target arm64-apple-macos14 Sources/main.swift -o "$APP/Contents/MacOS/TrueFullScreen"
+swiftc -Osize -target arm64-apple-macos14 -import-objc-header Sources/Bridge.h Sources/main.swift -o "$APP/Contents/MacOS/TrueFullScreen"
 strip -x "$APP/Contents/MacOS/TrueFullScreen"
 cp Resources/Info.plist "$APP/Contents/"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/"

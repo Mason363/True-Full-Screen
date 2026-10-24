@@ -15,19 +15,22 @@ Press the green button as usual. The menu bar and traffic lights still slide in 
 
 ![Menu bar and traffic lights on hover](docs/hover.png)
 
-<p align="center"><img src="docs/menu.png" width="218" alt="Menu"></p>
+<p align="center"><img src="docs/menu.png" width="200" alt="Menu"></p>
 
 - **True Full Screen** turns it on or off.
-- **Apps** lists open apps. Uncheck one to keep its bar.
+- **Apps** lists open apps. Uncheck one to give it normal full screen.
 
-Apps pick up changes the next time they open.
+## How
+
+The window moves to a notch-free virtual display the size of your screen, goes full screen there, and that display is shown edge to edge. Nothing runs until a window goes full screen. Idea from [MacNotchKiller](https://github.com/DTW7607/MacNotchKiller).
 
 ## Notes
 
-- 0% CPU, ~13 MB. It flips one macOS setting.
-- Unchecking a sandboxed app (Safari, Preview…) needs Full Disk Access.
-- Quitting keeps it on. Switch it off before deleting the app.
-- Tested on macOS 27.
+- Needs Accessibility and Screen Recording.
+- macOS shows its screen-recording dot while an app is in true full screen.
+- Its Space lives on the virtual display, so swipes and Mission Control won't reach it. Use ⌘Tab.
+- Idle: 0% CPU, ~15 MB.
+- Uses a private macOS API. Tested on macOS 27.
 
 ## Build
 

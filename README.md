@@ -11,22 +11,26 @@
 
 ![Before and after](docs/before-after.png)
 
-Press the green button as usual. Everything else works like normal full screen: the menu bar and traffic lights slide in on hover, and swipes, Mission Control and ⌘Tab behave as always.
+Press the green button as usual. The menu bar and traffic lights still slide in on hover.
 
 ![Menu bar and traffic lights on hover](docs/hover.png)
 
 <p align="center"><img src="docs/menu.png" width="200" alt="Menu"></p>
 
+- **True Full Screen** turns it on or off.
+- **Apps** lists open apps. Uncheck one to give it normal full screen.
+
 ## How
 
-While on, your screen runs on a notch-free virtual display the same size as the built-in one, mirrored onto it pixel for pixel. Full screen is plain macOS full screen, so it reaches the top edge. Inspired by [MacNotchKiller](https://github.com/DTW7607/MacNotchKiller).
+The window moves to a notch-free virtual display the size of your screen, goes full screen there, and that display is shown on yours edge to edge. Nothing runs until a window goes full screen. Inspired by [MacNotchKiller](https://github.com/DTW7607/MacNotchKiller).
 
 ## Notes
 
-- No permissions needed. 0% CPU, ~15 MB.
-- While on, the menu bar doesn't skip the notch, and HDR is limited.
-- The screen blinks once when it turns on or off.
-- Uses a private macOS API. Tested on macOS 27.
+- Needs Accessibility and Screen Recording.
+- macOS shows its screen-recording dot while an app is in true full screen.
+- Mission Control and swipes show your other Spaces. ⌘Tab gets you back.
+- Idle: 0% CPU, ~15 MB.
+- Uses private macOS APIs. Tested on macOS 27.
 
 ## Build
 

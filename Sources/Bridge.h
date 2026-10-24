@@ -11,7 +11,8 @@
 @end
 
 @interface CGVirtualDisplayMode : NSObject
-- (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate;
+// A transfer function of 1 gives the display HDR headroom.
+- (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)refreshRate transferFunction:(unsigned int)transferFunction;
 @end
 
 @interface CGVirtualDisplaySettings : NSObject

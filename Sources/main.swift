@@ -105,6 +105,19 @@ private func place(_ window: AXUIElement, at point: CGPoint) async {
     }
 }
 
+/// Returns once an app answers, which it does from its main thread, so once it's through whatever
+/// reached it before. Asked off the main thread here, which a slow app would otherwise hold up.
+private func caughtUp(_ pid: pid_t) async {
+    await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 2)
+            _ = value(app, kAXFocusedWindowAttribute)
+            done.resume()
+        }
+    }
+}
+
 /// Leaves full screen, asking again if the window is still animating in, then waits out the animation.
 private func leaveFullScreen(_ window: AXUIElement) async {
     for attempt in 0..<30 where isFullScreen(window) {
@@ -720,6 +733,7 @@ final class Stage: NSObject, SCStreamOutput {
     private var quietUntil = Date.distantPast
     private var movedTo = CGPoint.zero
     private let others: [CGRect]
+    private let born = ContinuousClock.now
 
     static func open(on screen: NSScreen, serial: UInt32, extra: Int) async -> Stage? {
         guard let mode = CGDisplayCopyDisplayMode(screen.displayID) else { return nil }
@@ -768,6 +782,10 @@ final class Stage: NSObject, SCStreamOutput {
             CGBeginDisplayConfiguration(&config)
             CGConfigureDisplayOrigin(config, id, Int32(others.maxX), Int32(others.maxY))
             CGCompleteDisplayConfiguration(config, .forSession)
+        }
+        // Every app learns of the display in its own time; this one knowing it, in place, is the earliest.
+        for _ in 0..<100 where !NSScreen.screens.contains(where: { $0.displayID == id && $0.frame == appKit(CGDisplayBounds(id)) }) {
+            try? await Task.sleep(for: .milliseconds(10))
         }
 
         let stage = Stage(display: display, panel: screen.displayID, extra: CGFloat(extra), pixels: CGSize(width: pixelWidth, height: pixelHeight))
@@ -818,6 +836,13 @@ final class Stage: NSObject, SCStreamOutput {
             }
         }
         return true
+    }
+
+    /// Waits until an app has surely caught up with the display coming online: a window landing on
+    /// a display its app doesn't know yet can bring the app down.
+    func settle(_ pid: pid_t) async {
+        try? await Task.sleep(until: born.advanced(by: .milliseconds(150)), clock: .continuous)
+        await caughtUp(pid)
     }
 
     private init(display: CGVirtualDisplay, panel: CGDirectDisplayID, extra: CGFloat, pixels: CGSize) {
@@ -1130,6 +1155,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var stage: Stage?
     private var opening = false
     private var closing = false
+    /// The stage on its way out wanted again (true), or in the way of a new one (false).
+    private var wanted: Bool?
+    private var terminating = false
     private var tap: CFMachPort?
     private var swallowMouseUp = false
     private var missionControl = false
@@ -1233,6 +1261,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Hands full screen windows back to the panel before quitting.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard stage != nil else { return .terminateNow }
+        terminating = true
         targets.forEach { release($0.window) }
         Task {
             for _ in 0..<100 where stage != nil {
@@ -1352,6 +1381,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let stage = await openStage(on: screen, sized: sized) else { return giveUp(window, sized: sized) }
         let standIn = StandIn(screen: screen, over: home, image: image, title: app?.localizedName ?? "")
         async let entered = standIn.enter()
+        await stage.settle(pid)
         if sized {
             if stage.top == 0 {
                 // macOS keeps the window below this display's menu bar: where it ends up is where the
@@ -1419,6 +1449,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func openStage(on screen: NSScreen, sized: Bool) async -> Stage? {
+        // One on its way out stays if it's the right kind, or goes now to make way.
+        if closing, let stage { wanted = (stage.extra > 0) == sized }
         while opening || closing { try? await Task.sleep(for: .milliseconds(10)) }
         // One kind at a time: windows sized to fill need a taller stage than full screen ones.
         if let stage { return (stage.extra > 0) == sized ? stage : nil }
@@ -1516,7 +1548,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Takes the stage down, once nothing is left on it: a window on a display that disappears
-    /// can end up nowhere.
+    /// can end up nowhere. And not at once: apps let go of a display in their own time, and one
+    /// that disappears while they still hold on to it can bring them down.
     private func close(_ stage: Stage) {
         guard !closing else { return }
         closing = true
@@ -1526,6 +1559,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             while tries < 25, sweep(stage) || stage.holdsWindows {
                 tries += 1
                 try? await Task.sleep(for: .milliseconds(100))
+            }
+            let since = ContinuousClock.now
+            while wanted == nil, since.duration(to: .now) < .seconds(terminating ? 1 : 3) {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            defer { wanted = nil }
+            if wanted == true, self.stage === stage {
+                closing = false
+                return
             }
             stage.close()
             let id = stage.id

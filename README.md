@@ -9,11 +9,15 @@
   <a href="https://github.com/Mason363/True-Full-Screen/releases/latest/download/True-Full-Screen.zip"><b>Download</b></a>
 </p>
 
-![Before and after](docs/before-after.png)
+![True full screen on a MacBook](docs/yosemite.png)
 
-Press the green button as usual. The menu bar and traffic lights still slide in on hover.
+Press the green button as usual. The menu bar and traffic lights still slide in at the top, and Mission Control, swipes and ⌘Tab work as with any full screen app.
 
-![Menu bar and traffic lights on hover](docs/hover.png)
+![Safari in true full screen](docs/wikipedia.png)
+
+Apps with no full screen of their own, like Photoshop, fill the screen too. ⌃⌘F, or the green button in the title bar that slides in, brings them back.
+
+![Photoshop in true full screen](docs/photoshop.png)
 
 <p align="center"><img src="docs/menu.png" width="200" alt="Menu"></p>
 
@@ -28,7 +32,7 @@ The window moves to a notch-free virtual display the size of your screen and goe
 
 - Needs Accessibility and Screen Recording.
 - macOS shows its screen-recording dot while an app is in true full screen.
-- Mission Control, swipes and ⌘Tab work as with any full screen app. Its Space is labeled True Full Screen.
+- Mission Control labels the Space True Full Screen.
 - Idle: 0% CPU, under 30 MB.
 - Uses private macOS APIs. Tested on macOS 27.
 

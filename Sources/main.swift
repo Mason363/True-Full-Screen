@@ -39,6 +39,10 @@ private func windows(of pid: pid_t) -> [AXUIElement] {
     value(AXUIElementCreateApplication(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
 }
 
+private func title(of window: AXUIElement) -> String {
+    value(window, kAXTitleAttribute) as? String ?? ""
+}
+
 private func isStandardWindow(_ window: AXUIElement) -> Bool {
     value(window, kAXSubroleAttribute) as? String == kAXStandardWindowSubrole
 }
@@ -49,6 +53,28 @@ private func isFullScreen(_ window: AXUIElement) -> Bool {
 
 private func setFullScreen(_ window: AXUIElement, _ on: Bool) {
     AXUIElementSetAttributeValue(window, "AXFullScreen" as CFString, (on ? kCFBooleanTrue : kCFBooleanFalse)!)
+}
+
+private func setSize(_ window: AXUIElement, _ size: CGSize) {
+    var size = size
+    AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, AXValueCreate(.cgSize, &size)!)
+}
+
+private func canResize(_ window: AXUIElement) -> Bool {
+    var settable: DarwinBoolean = false
+    return AXUIElementIsAttributeSettable(window, kAXSizeAttribute as CFString, &settable) == .success && settable.boolValue
+}
+
+/// Sizes and places a window, checking it took, since an app may adjust either.
+private func fit(_ window: AXUIElement, into rect: CGRect) async {
+    for _ in 0..<10 {
+        setSize(window, rect.size)
+        move(window, to: rect.origin)
+        setSize(window, rect.size)
+        try? await Task.sleep(for: .milliseconds(40))
+        if let now = frame(of: window), abs(now.minX - rect.minX) < 2, abs(now.minY - rect.minY) < 2,
+           abs(now.width - rect.width) < 2, abs(now.height - rect.height) < 2 { return }
+    }
 }
 
 @_silgen_name("_AXUIElementGetWindow")
@@ -104,6 +130,13 @@ private func appKit(_ rect: CGRect) -> NSRect {
 }
 
 private func pointer() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
+
+private func activeDisplays() -> [CGDirectDisplayID] {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+    var count: UInt32 = 0
+    CGGetActiveDisplayList(16, &ids, &count)
+    return Array(ids.prefix(Int(count)))
+}
 
 private func warp(_ point: CGPoint) {
     CGWarpMouseCursorPosition(point)
@@ -189,26 +222,33 @@ private let quiet: [String: CAAction] = ["contents": NSNull(), "opacity": NSNull
 
 /// This app's own full screen window on the panel, standing in for a window on the stage. It gets
 /// a Space of its own like any full screen window, so Spaces, swipes and Mission Control treat it as
-/// one, and shows the stage edge to edge. On the way in and out it shows a still of the window
-/// instead, growing out of and shrinking back to where the window sits.
+/// one, and shows the stage 1:1. macOS keeps it below the notch, under a black menu bar strip, so a
+/// band above that strip shows the top of the picture. On the way in and out it shows a still of
+/// the window instead, growing out of and shrinking back to where the window sits.
 @MainActor
 final class StandIn: NSObject, NSWindowDelegate {
     let window: PinnedWindow
-    private let full: NSRect
+    let full: NSRect
+    /// Where macOS lets a full screen window be: below the notch.
+    private var safe: NSRect
     private var home: NSRect
     private let still = CALayer()
     private let live = CALayer()
-    /// Over the strip beside the notch, should macOS keep even this window below it.
-    private var band: PinnedWindow?
+    private let band: PinnedWindow
     private let bandLive = CALayer()
     /// The frame on show, kept so the stream can't reuse it while it's still up.
     private var frame: CMSampleBuffer?
     private(set) var isLive = false
     private var transition: CheckedContinuation<Bool, Never>?
+    /// Where the stage's picture lands on the panel. The window shows its part of it 1:1, the band the top.
+    var picture: NSRect { didSet { layout() } }
 
     init(screen: NSScreen, over rect: CGRect, image: CGImage?, title: String) {
         full = screen.frame
+        safe = full
+        picture = full
         home = appKit(rect)
+        band = PinnedWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
         window = PinnedWindow(contentRect: home, styleMask: [.titled, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
         super.init()
@@ -221,7 +261,6 @@ final class StandIn: NSObject, NSWindowDelegate {
         window.collectionBehavior = [.fullScreenPrimary]
         window.animationBehavior = .none
         window.isReleasedWhenClosed = false
-        window.ignoresMouseEvents = true
         window.hasShadow = false
         window.backgroundColor = .black
         window.delegate = self
@@ -241,6 +280,21 @@ final class StandIn: NSObject, NSWindowDelegate {
         still.contentsGravity = .resizeAspect
         still.contents = image
         window.setFrame(home, display: false)
+
+        // Above the menu bar strip macOS puts over full screen windows, in this one's Space.
+        band.level = .statusBar
+        band.backgroundColor = .black
+        band.hasShadow = false
+        band.ignoresMouseEvents = true
+        band.isReleasedWhenClosed = false
+        band.animationBehavior = .none
+        band.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+        band.contentView = NSView()
+        band.contentView?.wantsLayer = true
+        band.contentView?.layer?.masksToBounds = true
+        bandLive.actions = quiet
+        bandLive.contentsGravity = .resize
+        band.contentView?.layer?.addSublayer(bandLive)
         // Right over the window it stands in for.
         window.orderFrontRegardless()
     }
@@ -305,19 +359,44 @@ final class StandIn: NSObject, NSWindowDelegate {
         CATransaction.commit()
     }
 
-    /// Keeps the last frame, while the stage shows something that isn't the window.
+    /// Keeps the last frame, while the stage shows something that isn't the window. The band stays,
+    /// in this window's Space, so the top is there whenever the Space is.
     func hold() { isLive = false }
 
-    /// Shows the window's own picture instead, in case the last frame caught something else.
+    /// Takes the band away, for Mission Control, which would show it over everything.
+    func hideBand() { band.orderOut(nil) }
+
+    /// Shows the window's own picture instead, in case the last frame caught something else, and
+    /// without the pointer, which is elsewhere by then.
     func cover(_ image: CGImage) {
         guard !isLive else { return }
         still.contents = image
         still.contentsGravity = .resize
+        still.autoresizingMask = []
+        still.frame = live.frame
         still.opacity = 1
+    }
+
+    /// Puts the band over the strip above the window, where displays coming and going don't leave it.
+    func pin() {
+        let strip = NSRect(x: full.minX, y: window.frame.maxY, width: full.width, height: full.maxY - window.frame.maxY)
+        guard isFullScreen, strip.height > 0 else { return }
+        band.setFrame(strip, display: false)
+        layout()
+    }
+
+    private func layout() {
+        guard isFullScreen else { return }
+        live.autoresizingMask = []
+        live.frame = picture.offsetBy(dx: -window.frame.minX, dy: -window.frame.minY)
+        bandLive.frame = picture.offsetBy(dx: -band.frame.minX, dy: -band.frame.minY)
     }
 
     /// Follows the stage again, cross-fading from the still the first time.
     func goLive() {
+        pin()
+        // Ordered in while its Space is up, which puts it in that Space.
+        if !band.isVisible, window.frame.maxY < full.maxY { band.orderFrontRegardless() }
         guard !isLive else { return }
         isLive = true
         guard still.opacity > 0 else { return }
@@ -338,7 +417,7 @@ final class StandIn: NSObject, NSWindowDelegate {
     func close() {
         isLive = false
         finish(false)
-        band?.orderOut(nil)
+        band.close()
         window.orderOut(nil)
         window.close()
         for layer in [still, live, bandLive] { layer.contents = nil }
@@ -347,7 +426,10 @@ final class StandIn: NSObject, NSWindowDelegate {
 
     // MARK: Full screen
 
-    func window(_ window: NSWindow, willUseFullScreenContentSize proposedSize: NSSize) -> NSSize { full.size }
+    func window(_ window: NSWindow, willUseFullScreenContentSize proposedSize: NSSize) -> NSSize {
+        safe.size = proposedSize
+        return proposedSize
+    }
 
     func customWindowsToEnterFullScreen(for window: NSWindow) -> [NSWindow]? { [window] }
 
@@ -355,13 +437,12 @@ final class StandIn: NSObject, NSWindowDelegate {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0, 0.1, 1)
-            window.animator().setFrame(full, display: true)
+            window.animator().setFrame(safe, display: true)
         }
     }
 
     func windowDidEnterFullScreen(_ notification: Notification) {
-        if window.frame != full { window.setFrame(full, display: true) }
-        if window.frame.maxY < full.maxY - 1 { addBand() }
+        layout()
         finish(true)
     }
 
@@ -370,10 +451,11 @@ final class StandIn: NSObject, NSWindowDelegate {
     func customWindowsToExitFullScreen(for window: NSWindow) -> [NSWindow]? { [window] }
 
     func window(_ window: NSWindow, startCustomAnimationToExitFullScreenWithDuration duration: TimeInterval) {
-        if let band {
-            band.orderOut(nil)
-            live.frame = window.contentView?.bounds ?? live.frame
-            live.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        band.orderOut(nil)
+        // The whole picture shrinks with the window.
+        for layer in [live, still] {
+            layer.frame = window.contentView?.bounds ?? layer.frame
+            layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
@@ -386,27 +468,201 @@ final class StandIn: NSObject, NSWindowDelegate {
 
     func windowDidFailToExitFullScreen(_ window: NSWindow) { finish(false) }
 
-    /// Covers the strip beside the notch with the top of the picture, the window the rest.
-    private func addBand() {
-        let rect = NSRect(x: full.minX, y: window.frame.maxY, width: full.width, height: full.maxY - window.frame.maxY)
-        let band = PinnedWindow(contentRect: rect, styleMask: .borderless, backing: .buffered, defer: false)
-        band.backgroundColor = .black
-        band.hasShadow = false
-        band.ignoresMouseEvents = true
-        band.isReleasedWhenClosed = false
-        band.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
-        band.contentView = NSView()
-        band.contentView?.wantsLayer = true
-        band.contentView?.layer?.masksToBounds = true
-        bandLive.actions = quiet
-        bandLive.contentsGravity = .resize
-        bandLive.frame = CGRect(x: 0, y: full.minY - rect.minY, width: full.width, height: full.height)
-        band.contentView?.layer?.addSublayer(bandLive)
-        window.addChildWindow(band, ordered: .above)
-        band.setFrame(rect, display: false)
-        live.autoresizingMask = []
-        live.frame = CGRect(x: 0, y: full.minY - window.frame.minY, width: full.width, height: full.height)
-        self.band = band
+}
+
+// MARK: - Pointer
+
+private let currentCursorSeed = dlsym(skyLight, "SLSCurrentCursorSeed").map { unsafeBitCast($0, to: (@convention(c) () -> UInt32).self) }
+private let cursorIsVisible = dlsym(dlopen(nil, RTLD_NOW), "CGCursorIsVisible").map { unsafeBitCast($0, to: (@convention(c) () -> UInt32).self) }
+private let getCursorScale = dlsym(skyLight, "SLSGetCursorScale")
+    .map { unsafeBitCast($0, to: (@convention(c) (Int32, UnsafeMutablePointer<Float>) -> Int32).self) }
+
+/// The pointer, drawn on the panel where it is on the stage, as soon as it moves: the stage's own
+/// picture of it would trail a few frames behind.
+@MainActor
+final class Pointer {
+    private let window = PinnedWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+    private let view = NSImageView()
+    private var seed = UInt32.max
+    private var hotSpot = CGPoint.zero
+    private var spot = CGPoint.zero
+    private var timer: Timer?
+
+    init() {
+        window.level = NSWindow.Level(Int(CGWindowLevelForKey(.cursorWindow)) - 1)
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.animationBehavior = .none
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        view.imageScaling = .scaleAxesIndependently
+        window.contentView = view
+    }
+
+    /// Shows it at a spot on the panel, in global display coordinates.
+    func show(at point: CGPoint) {
+        spot = point
+        if !window.isVisible {
+            refresh()
+            window.orderFrontRegardless()
+            // Its look can change while it stands still: typing hides it, apps swap it.
+            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refresh() }
+            }
+        }
+        place()
+    }
+
+    func hide() {
+        timer?.invalidate()
+        timer = nil
+        window.orderOut(nil)
+    }
+
+    private func place() {
+        window.setFrameOrigin(appKit(CGRect(origin: spot - hotSpot, size: window.frame.size)).origin)
+    }
+
+    /// Takes on the pointer's current look, size and visibility.
+    private func refresh() {
+        window.alphaValue = cursorIsVisible?() == 0 ? 0 : 1
+        guard let current = currentCursorSeed?(), current != seed else { return }
+        seed = current
+        let cursor = NSCursor.currentSystem ?? .arrow
+        var scale: Float = 1
+        _ = getCursorScale?(connection, &scale)
+        let factor = CGFloat(max(scale, 1))
+        hotSpot = CGPoint(x: cursor.hotSpot.x * factor, y: cursor.hotSpot.y * factor)
+        view.image = cursor.image
+        window.setContentSize(NSSize(width: cursor.image.size.width * factor, height: cursor.image.size.height * factor))
+        place()
+    }
+}
+
+// MARK: - Title bar
+
+/// A window button, drawn as the system's are for the window in front: the system's own only draw
+/// in color while their app is in front, which this one never is.
+private final class Light: NSButton {
+    private let fill: NSColor
+    private let rim: NSColor
+    private let symbol: String
+    var showsSymbol = false { didSet { needsDisplay = true } }
+
+    init(_ fill: NSColor, rim: NSColor, symbol: String) {
+        self.fill = fill
+        self.rim = rim
+        self.symbol = symbol
+        super.init(frame: NSRect(x: 0, y: 0, width: 13, height: 13))
+        isBordered = false
+        title = ""
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 0.5, dy: 0.5))
+        (isEnabled ? fill : NSColor(white: 0.5, alpha: 0.5)).setFill()
+        circle.fill()
+        (isEnabled ? rim : NSColor(white: 0.35, alpha: 0.5)).setStroke()
+        circle.lineWidth = 0.5
+        circle.stroke()
+        guard showsSymbol, isEnabled,
+              let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 7, weight: .bold)) else { return }
+        let glyph = NSImage(size: image.size, flipped: false) { rect in
+            image.draw(in: rect)
+            NSColor(white: 0, alpha: 0.55).set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        glyph.draw(in: NSRect(x: (bounds.width - image.size.width) / 2, y: (bounds.height - image.size.height) / 2,
+                              width: image.size.width, height: image.size.height))
+    }
+}
+
+/// Shows the buttons' symbols while the pointer is over any of them, as a title bar does.
+private final class ButtonGroup: NSView {
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { show(true) }
+    override func mouseExited(with event: NSEvent) { show(false) }
+    private func show(_ on: Bool) { subviews.compactMap { $0 as? Light }.forEach { $0.showsSymbol = on } }
+}
+
+private final class PinnedPanel: NSPanel {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
+/// A title bar with window buttons, for a window sized to fill the stage, whose app draws none of
+/// its own there. It comes in over the top of the window along with the menu bar, as a full screen
+/// window's does, and goes with it.
+@MainActor
+final class TitleBar: NSObject {
+    static let height: CGFloat = 28
+    private let window = PinnedPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    private let label = NSTextField(labelWithString: "")
+    private let onClose: () -> Void
+    private let onLeave: () -> Void
+
+    /// `rect` in global display coordinates.
+    init(_ rect: CGRect, onClose: @escaping () -> Void, onLeave: @escaping () -> Void) {
+        self.onClose = onClose
+        self.onLeave = onLeave
+        super.init()
+        window.level = .floating
+        window.hidesOnDeactivate = false
+        window.hasShadow = false
+        window.animationBehavior = .none
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.ignoresCycle, .stationary]
+        let material = NSVisualEffectView()
+        material.material = .titlebar
+        material.blendingMode = .withinWindow
+        material.state = .active
+        window.contentView = material
+        let group = ButtonGroup(frame: NSRect(x: 0, y: 0, width: 72, height: Self.height))
+        let lights = [(Light(NSColor(srgbRed: 1, green: 0.373, blue: 0.341, alpha: 1), rim: NSColor(srgbRed: 0.886, green: 0.275, blue: 0.247, alpha: 1), symbol: "xmark"), #selector(close(_:))),
+                      (Light(NSColor(srgbRed: 0.996, green: 0.737, blue: 0.180, alpha: 1), rim: NSColor(srgbRed: 0.882, green: 0.631, blue: 0.086, alpha: 1), symbol: "minus"), nil),
+                      (Light(NSColor(srgbRed: 0.157, green: 0.784, blue: 0.251, alpha: 1), rim: NSColor(srgbRed: 0.071, green: 0.675, blue: 0.157, alpha: 1), symbol: "arrow.down.right.and.arrow.up.left"), #selector(leave(_:)))]
+        for (index, (light, action)) in lights.enumerated() {
+            light.setFrameOrigin(NSPoint(x: 12 + CGFloat(index) * 20, y: (Self.height - 13) / 2))
+            light.target = self
+            light.action = action
+            // Minimizing has no place in full screen.
+            light.isEnabled = action != nil
+            group.addSubview(light)
+        }
+        material.addSubview(group)
+        label.font = .titleBarFont(ofSize: NSFont.systemFontSize)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingMiddle
+        label.frame = NSRect(x: 80, y: (Self.height - 16) / 2, width: rect.width - 160, height: 16)
+        material.addSubview(label)
+        window.setFrame(appKit(rect), display: false)
+    }
+
+    func show(_ on: Bool) {
+        if on { window.orderFrontRegardless() } else { window.orderOut(nil) }
+    }
+
+    var title: String {
+        get { label.stringValue }
+        set { if label.stringValue != newValue { label.stringValue = newValue } }
+    }
+
+    @objc private func close(_ sender: Any?) { onClose() }
+    @objc private func leave(_ sender: Any?) { onLeave() }
+
+    func close() {
+        window.orderOut(nil)
+        window.close()
     }
 }
 
@@ -415,7 +671,9 @@ final class StandIn: NSObject, NSWindowDelegate {
 /// Private event fields: what kind of gesture an event is part of, and how far along it is.
 private let gestureKind = CGEventField(rawValue: 110)!
 private let gesturePhase = CGEventField(rawValue: 132)!
+private let gestureMotion = CGEventField(rawValue: 123)!
 private let dockSwipe: Int64 = 23
+private let vertical: Int64 = 2
 
 /// A notch-free virtual display the size of the built-in one, and its live picture.
 @MainActor
@@ -424,25 +682,49 @@ final class Stage: NSObject, SCStreamOutput {
     let panel: CGRect
     let panelID: CGDirectDisplayID
     let id: CGDirectDisplayID
+    /// Room above the panel's height, for windows that can't go full screen: macOS keeps them below
+    /// this display's menu bar. 0 for windows that go full screen here.
+    let extra: CGFloat
+    /// How far down the stage the panel's picture starts: below the menu bar, where such a window sits.
+    var top: CGFloat = 0 { didSet { offset = top } }
+    /// Where the picture starts right now: at the very top while the menu bar is out.
+    private(set) var offset: CGFloat = 0
+    var onOffset: (() -> Void)?
+    /// ⌃⌘F, the way out of full screen, pressed: windows sized to fill have no full screen to leave.
+    var onExitKey: (() -> Bool)?
+    private var keys: CFMachPort?
+    private let pixels: CGSize
     var onFrame: ((CMSampleBuffer) -> Void)?
-    /// A system swipe (Spaces, Mission Control) starting or ending.
-    var onSwipe: ((Bool) -> Void)?
+    /// A system swipe starting (true) or ending (false), and whether it's up or down: Mission
+    /// Control or App Exposé rather than Spaces.
+    var onSwipe: ((Bool, Bool) -> Void)?
     private var display: CGVirtualDisplay?
     private var stream: SCStream?
-    private var latest: CMSampleBuffer?
-    private var lastFrame = Date.distantPast
+    /// The last frame: one only comes when something changes, so a stand-in going live starts on this.
+    private(set) var latest: CMSampleBuffer?
+    /// The live picture starting, and whether it did.
+    var capturing: Task<Bool, Never>?
+    private var configuration: SCStreamConfiguration?
+    private var interval = CMTime.zero
     private var fence: CFMachPort?
     private var swipes: CFMachPort?
     /// Whether the pointer belongs on the stage (true) or must stay off it (false).
     private var confined = false
+    /// Where something else is over the stand-in on the panel (a notification, an alert): the
+    /// pointer goes there instead of through it to the stage.
+    var openings: [CGRect] = []
+    private var visiting = false
+    private let sprite = Pointer()
     private var swiping = false
     private var lastSwipe = Date.distantPast
     private var quietUntil = Date.distantPast
+    private var movedTo = CGPoint.zero
     private let others: [CGRect]
 
-    static func open(on screen: NSScreen, serial: UInt32) async -> Stage? {
+    static func open(on screen: NSScreen, serial: UInt32, extra: Int) async -> Stage? {
         guard let mode = CGDisplayCopyDisplayMode(screen.displayID) else { return nil }
-        let (width, height, pixelWidth, pixelHeight, refreshRate) = (mode.width, mode.height, mode.pixelWidth, mode.pixelHeight, mode.refreshRate)
+        let scale = mode.pixelHeight / mode.height
+        let (width, height, pixelWidth, pixelHeight, refreshRate) = (mode.width, mode.height + extra, mode.pixelWidth, mode.pixelHeight + extra * scale, mode.refreshRate)
         let size = CGDisplayScreenSize(screen.displayID)
         // Created off the main thread, which it would otherwise hold up, and every click with it.
         let queue = DispatchQueue(label: "TrueFullScreen.display")
@@ -473,44 +755,61 @@ final class Stage: NSObject, SCStreamOutput {
         guard let display = made else { return nil }
 
         let id = display.displayID
-        var target: SCDisplay?
-        for _ in 0..<100 where target == nil {
-            if NSScreen.screens.contains(where: { $0.displayID == id }) {
-                target = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true).displays.first { $0.displayID == id }
-            }
-            if target == nil { try? await Task.sleep(for: .milliseconds(10)) }
+        for _ in 0..<200 where CGDisplayIsActive(id) == 0 {
+            try? await Task.sleep(for: .milliseconds(5))
         }
-        guard let target else { return nil }
+        guard CGDisplayIsActive(id) != 0 else { return nil }
 
         // Touch the other displays only at a corner, so the pointer stays on whichever side it's put.
-        let others = NSScreen.screens.filter { $0.displayID != id }.reduce(CGRect.null) { $0.union(CGDisplayBounds($1.displayID)) }
-        var config: CGDisplayConfigRef?
-        CGBeginDisplayConfiguration(&config)
-        CGConfigureDisplayOrigin(config, id, Int32(others.maxX), Int32(others.maxY))
-        CGCompleteDisplayConfiguration(config, .forSession)
+        // macOS remembers the spot, so after the first time it's already there.
+        let others = activeDisplays().filter { $0 != id }.reduce(CGRect.null) { $0.union(CGDisplayBounds($1)) }
+        if CGDisplayBounds(id).origin != CGPoint(x: others.maxX, y: others.maxY) {
+            var config: CGDisplayConfigRef?
+            CGBeginDisplayConfiguration(&config)
+            CGConfigureDisplayOrigin(config, id, Int32(others.maxX), Int32(others.maxY))
+            CGCompleteDisplayConfiguration(config, .forSession)
+        }
 
-        let stage = Stage(display: display, panel: screen.displayID)
+        let stage = Stage(display: display, panel: screen.displayID, extra: CGFloat(extra), pixels: CGSize(width: pixelWidth, height: pixelHeight))
+        // Capture gets going meanwhile: it isn't needed until the window is full screen there.
+        stage.capturing = Task { await stage.capture(mode) }
+        return stage
+    }
+
+    /// Starts the live picture. Returns whether it did.
+    private func capture(_ mode: CGDisplayMode) async -> Bool {
+        var target: SCDisplay?
+        for _ in 0..<100 where target == nil {
+            target = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true).displays.first { $0.displayID == id }
+            if target == nil { try? await Task.sleep(for: .milliseconds(10)) }
+        }
+        guard let target, display != nil else { return false }
         let configuration = SCStreamConfiguration()
-        configuration.width = mode.pixelWidth
-        configuration.height = mode.pixelHeight
+        configuration.width = Int(pixels.width)
+        configuration.height = Int(pixels.height)
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(mode.refreshRate, 60)))
-        configuration.showsCursor = true
+        interval = configuration.minimumFrameInterval
+        // The pointer is drawn on the panel directly, sooner than a frame could show it.
+        configuration.showsCursor = false
         configuration.queueDepth = 3
         configuration.colorSpaceName = CGColorSpace.displayP3
+        self.configuration = configuration
         let stream = SCStream(filter: SCContentFilter(display: target, excludingWindows: []), configuration: configuration, delegate: nil)
-        guard (try? stream.addStreamOutput(stage, type: .screen, sampleHandlerQueue: .main)) != nil,
-              (try? await stream.startCapture()) != nil else {
-            stage.close()
-            return nil
+        guard (try? stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)) != nil,
+              (try? await stream.startCapture()) != nil else { return false }
+        // Taken down meanwhile.
+        guard display != nil else {
+            try? await stream.stopCapture()
+            return false
         }
-        stage.stream = stream
+        self.stream = stream
         // macOS marks every display while it's being captured. The panel shows its own mark, so
         // leave the stage's out of the picture rather than show two.
-        let bounds = stage.bounds
-        Task { [weak stage] in
+        let bounds = bounds
+        Task { [weak self] in
             for _ in 0..<12 {
                 try? await Task.sleep(for: .milliseconds(250))
-                guard let stream = stage?.stream else { return }
+                guard let stream = self?.stream else { return }
                 let windows = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true).windows
                 let marks = windows?.filter { $0.title == "StatusIndicator" && $0.frame.intersects(bounds) } ?? []
                 guard !marks.isEmpty else { continue }
@@ -518,16 +817,18 @@ final class Stage: NSObject, SCStreamOutput {
                 return
             }
         }
-        return stage
+        return true
     }
 
-    private init(display: CGVirtualDisplay, panel: CGDirectDisplayID) {
+    private init(display: CGVirtualDisplay, panel: CGDirectDisplayID, extra: CGFloat, pixels: CGSize) {
         self.display = display
+        self.extra = extra
+        self.pixels = pixels
         panelID = panel
         self.panel = CGDisplayBounds(panel)
         id = display.displayID
         bounds = CGDisplayBounds(display.displayID)
-        others = NSScreen.screens.map { CGDisplayBounds($0.displayID) }.filter { $0 != CGDisplayBounds(display.displayID) }
+        others = activeDisplays().filter { $0 != display.displayID }.map(CGDisplayBounds)
         super.init()
         let moves: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         fence = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
@@ -537,55 +838,111 @@ final class Stage: NSObject, SCStreamOutput {
         swipes = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                    eventsOfInterest: 1 << 29 | 1 << 30 | 1 << 31,
                                    callback: swipeCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
-        for tap in [fence, swipes].compactMap({ $0 }) {
+        if extra > 0 {
+            keys = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                     eventsOfInterest: 1 << CGEventType.keyDown.rawValue,
+                                     callback: keyCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
+        }
+        for tap in [fence, swipes, keys].compactMap({ $0 }) {
             CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
         }
+    }
+
+    /// Whether a key press is ⌃⌘F, handled here. Returns true to swallow it.
+    fileprivate func exitKey(_ type: CGEventType, _ event: CGEvent) -> Bool {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let keys { CGEvent.tapEnable(tap: keys, enable: true) }
+            return false
+        }
+        let modifiers = event.flags.intersection([.maskControl, .maskCommand, .maskAlternate, .maskShift])
+        guard modifiers == [.maskControl, .maskCommand], event.getIntegerValueField(.keyboardEventKeycode) == 3 else { return false }
+        return onExitKey?() ?? false
     }
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard buffer.imageBuffer != nil else { return }
         MainActor.assumeIsolated {
             latest = buffer
-            lastFrame = Date()
             onFrame?(buffer)
         }
     }
 
-    /// Waits for whatever is animating on the display to finish.
-    func settle(atLeast: Duration, atMost: Duration) async {
-        let start = ContinuousClock.now
-        try? await Task.sleep(for: atLeast)
-        while ContinuousClock.now - start < atMost, Date().timeIntervalSince(lastFrame) < 0.08 {
-            try? await Task.sleep(for: .milliseconds(20))
-        }
+    /// The part of the stage the panel shows.
+    var shown: CGRect { CGRect(x: bounds.minX, y: bounds.minY + offset, width: panel.width, height: panel.height) }
+
+    /// Where the stage's picture lands on a panel with the given frame, in AppKit's coordinates.
+    func picture(over full: NSRect) -> NSRect {
+        NSRect(x: full.minX, y: full.maxY + offset - bounds.height, width: bounds.width, height: bounds.height)
     }
+
+    private func onPanel(_ point: CGPoint) -> CGPoint { point - shown.origin + panel.origin }
+    private func onStage(_ point: CGPoint) -> CGPoint { point - panel.origin + shown.origin }
 
     /// Moves the pointer onto the display and keeps it there, or back to the same spot on the panel.
     func hold(pointer on: Bool) {
         confined = on
         let point = pointer()
-        if on, !bounds.contains(point) {
-            move(to: panel.contains(point) ? point - panel.origin + bounds.origin : CGPoint(x: bounds.midX, y: bounds.midY))
+        if on, visiting, panel.contains(point), openings.contains(where: { $0.contains(point) }) { return }
+        visiting = false
+        if on, !shown.contains(point) {
+            move(to: panel.contains(point) ? onStage(point) : CGPoint(x: shown.midX, y: shown.midY))
         } else if !on, bounds.contains(point) {
-            move(to: point - bounds.origin + panel.origin)
+            move(to: clamp(onPanel(point), into: panel))
         }
+        if on { sprite.show(at: onPanel(pointer())) } else { sprite.hide() }
     }
 
     private func move(to point: CGPoint) {
         warp(point)
         // Events from before the move still carry the old spot.
         quietUntil = Date().addingTimeInterval(0.08)
+        movedTo = point
+        if confined, !visiting, shown.contains(point) { sprite.show(at: onPanel(point)) }
     }
 
     /// The stage touches the other displays at a corner, which the pointer could slip through:
     /// keep it on the stage while it's in front, and off it otherwise.
     fileprivate func keep(_ point: CGPoint) {
+        let quiet = Date() < quietUntil
+        if confined, !visiting, top > 0, !quiet { revealMenuBar(point) }
+        // Just after a move, only events from around the new spot are current.
+        if confined, shown.contains(point), !visiting, Date() >= quietUntil || hypot(point.x - movedTo.x, point.y - movedTo.y) < 60 {
+            sprite.show(at: onPanel(point))
+        }
         guard Date() >= quietUntil else { return }
-        if confined, !bounds.contains(point) {
-            move(to: clamp(point, into: bounds))
-        } else if !confined, bounds.contains(point) {
+        if confined, shown.contains(point) {
+            let spot = onPanel(point)
+            visiting = openings.contains(where: { $0.contains(spot) })
+            if visiting {
+                sprite.hide()
+                move(to: spot)
+            }
+        } else if confined, visiting, panel.contains(point) {
+            if !openings.contains(where: { $0.contains(point) }) {
+                visiting = false
+                move(to: onStage(point))
+                sprite.show(at: point)
+            }
+        } else if confined {
+            move(to: clamp(point, into: shown))
+        } else if bounds.contains(point) {
             let display = others.min { distance(point, to: $0) < distance(point, to: $1) } ?? panel
             move(to: clamp(point, into: display))
+        }
+    }
+
+    /// A window that can't go full screen sits below this display's menu bar, out of the picture.
+    /// Pushing past the top edge brings the menu bar in, as over full screen windows, until the
+    /// pointer moves well below it again. The pointer keeps its spot on the panel either way.
+    private func revealMenuBar(_ point: CGPoint) {
+        if offset > 0, point.y < shown.minY, bounds.contains(point) {
+            offset = 0
+            onOffset?()
+            move(to: CGPoint(x: point.x, y: bounds.minY))
+        } else if offset == 0, point.y > bounds.minY + top + TitleBar.height + 24 {
+            offset = top
+            onOffset?()
+            move(to: CGPoint(x: point.x, y: point.y + top))
         }
     }
 
@@ -600,12 +957,12 @@ final class Stage: NSObject, SCStreamOutput {
         if !swiping, confined {
             swiping = true
             hold(pointer: false)
-            onSwipe?(true)
+            onSwipe?(true, event.getIntegerValueField(gestureMotion) == vertical)
             watchSwipe()
         }
         guard swiping else { return }
         lastSwipe = Date()
-        if bounds.contains(event.location) { event.location = event.location - bounds.origin + panel.origin }
+        if bounds.contains(event.location) { event.location = onPanel(event.location) }
         // Ended, or cancelled.
         if event.getIntegerValueField(gesturePhase) & (4 | 8) != 0 { endSwipe() }
     }
@@ -621,7 +978,7 @@ final class Stage: NSObject, SCStreamOutput {
     private func endSwipe() {
         guard swiping else { return }
         swiping = false
-        onSwipe?(false)
+        onSwipe?(false, false)
     }
 
     private func clamp(_ point: CGPoint, into rect: CGRect) -> CGPoint {
@@ -631,6 +988,14 @@ final class Stage: NSObject, SCStreamOutput {
     private func distance(_ point: CGPoint, to rect: CGRect) -> CGFloat {
         let near = clamp(point, into: rect)
         return hypot(point.x - near.x, point.y - near.y)
+    }
+
+    /// Slows capture to a trickle while nothing of the stage shows (Mission Control), sparing the
+    /// work while the system animates, or brings it back to full speed.
+    func idle(_ on: Bool) {
+        guard let stream, let configuration else { return }
+        configuration.minimumFrameInterval = on ? CMTime(value: 1, timescale: 2) : interval
+        stream.updateConfiguration(configuration) { _ in }
     }
 
     /// Whether an app window still belongs to one of the display's Spaces, even one already moved
@@ -655,9 +1020,11 @@ final class Stage: NSObject, SCStreamOutput {
 
     func close() {
         hold(pointer: false)
-        for tap in [fence, swipes].compactMap({ $0 }) { CFMachPortInvalidate(tap) }
+        sprite.hide()
+        for tap in [fence, swipes, keys].compactMap({ $0 }) { CFMachPortInvalidate(tap) }
         fence = nil
         swipes = nil
+        keys = nil
         onFrame = nil
         onSwipe = nil
         try? stream?.removeStreamOutput(self, type: .screen)
@@ -679,6 +1046,11 @@ private let swipeCallback: CGEventTapCallBack = { _, type, event, info in
     let stage = Unmanaged<Stage>.fromOpaque(info!).takeUnretainedValue()
     MainActor.assumeIsolated { stage.route(type, event) }
     return Unmanaged.passUnretained(event)
+}
+
+private let keyCallback: CGEventTapCallBack = { _, type, event, info in
+    let stage = Unmanaged<Stage>.fromOpaque(info!).takeUnretainedValue()
+    return MainActor.assumeIsolated { stage.exitKey(type, event) } ? nil : Unmanaged.passUnretained(event)
 }
 
 private let clickCallback: CGEventTapCallBack = { _, type, event, info in
@@ -738,7 +1110,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let id: CGWindowID
         let home: CGRect
         let standIn: StandIn
+        /// A window that can't go full screen, sized to fill the stage below its menu bar instead.
+        let sized: Bool
+        /// The title bar its app doesn't draw there, between the menu bar and the window.
+        let titleBar: TitleBar?
         var leaving = false
+
+        @MainActor func close() {
+            standIn.close()
+            titleBar?.close()
+        }
     }
 
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -755,6 +1136,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var swiping = false
     private var checking = false
     private var missionControlTimer: Timer?
+    private var missionControlSince = Date.distantPast
     /// Where windows were when their app quit in full screen, by bundle ID, to put them back on relaunch.
     private var homes: [String: CGRect] = [:]
     private var termination: DispatchSourceSignal?
@@ -851,7 +1233,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Hands full screen windows back to the panel before quitting.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard stage != nil else { return .terminateNow }
-        targets.forEach { setFullScreen($0.window, false) }
+        targets.forEach { release($0.window) }
         Task {
             for _ in 0..<100 where stage != nil {
                 update()
@@ -868,12 +1250,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func screensChanged() {
+        targets.forEach { $0.standIn.pin() }
         // The panel went away (lid closed). With nothing left to show the stage on, macOS would move
         // every window and Space onto it, so take it down at once.
         guard let stage, CGDisplayIsOnline(stage.panelID) == 0 || CGDisplayBounds(stage.panelID) != stage.panel else { return }
         for target in targets {
-            setFullScreen(target.window, false)
-            target.standIn.close()
+            if target.sized { setSize(target.window, target.home.size) } else { setFullScreen(target.window, false) }
+            target.close()
         }
         targets.removeAll()
         stage.close()
@@ -906,10 +1289,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             swallowMouseUp = false
             return true
         case .leftMouseDown:
+            // The green button of a window sized to fill the stage, which can't leave full screen on its own.
+            if let target = targets.first(where: { $0.sized && !$0.leaving && element($0.window, kAXZoomButtonAttribute)
+                .flatMap(frame(of:))?.contains(event.location) == true }) {
+                swallowMouseUp = true
+                leave(target.window)
+                return true
+            }
             // Windows that can't be moved get the app's own full screen.
-            guard let (window, pid) = greenButtonWindow(at: event), !ignored.contains(where: { CFEqual($0, window) }) else { return false }
+            guard let (window, pid, sized) = greenButtonWindow(at: event), !ignored.contains(where: { CFEqual($0, window) }) else { return false }
             swallowMouseUp = true
-            Task { await takeOver(window, pid: pid) }
+            Task { await takeOver(window, pid: pid, sized: sized) }
             return true
         default:
             break
@@ -917,7 +1307,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
-    private func greenButtonWindow(at event: CGEvent) -> (AXUIElement, pid_t)? {
+    /// The window whose green button is under the click, and whether that button only zooms it, the
+    /// window having no full screen of its own (Photoshop's): such a window is sized to fill instead.
+    private func greenButtonWindow(at event: CGEvent) -> (AXUIElement, pid_t, Bool)? {
         let point = event.location
         var hit: AXUIElement?
         var pid: pid_t = 0
@@ -926,11 +1318,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
               AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &hit) == .success, let hit
         else { return nil }
         let window = element(hit, kAXWindowAttribute) ?? hit
-        guard let button = element(window, kAXFullScreenButtonAttribute), frame(of: button)?.contains(point) == true,
+        let fullScreenButton = element(window, kAXFullScreenButtonAttribute)
+        let sized = fullScreenButton == nil
+        guard let button = fullScreenButton ?? element(window, kAXZoomButtonAttribute), frame(of: button)?.contains(point) == true,
+              !sized || isStandardWindow(window) && canResize(window),
               AXUIElementGetPid(window, &pid) == .success, pid != getpid(), !isFullScreen(window),
               let id = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier, !excluded.contains(id),
               CGPreflightScreenCaptureAccess() else { return nil }
-        return (window, pid)
+        return (window, pid, sized)
     }
 
     /// Windows already handled, on their way, or left alone because they couldn't be moved.
@@ -940,7 +1335,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Moves a window to the stage and takes it full screen there, while its stand-in grows out of
     /// it into a full screen Space on the panel, so nothing blinks or jumps along the way.
-    private func takeOver(_ window: AXUIElement, pid: pid_t) async {
+    private func takeOver(_ window: AXUIElement, pid: pid_t, sized: Bool) async {
         guard !isBusy(window), let screen = NSScreen.notched else { return }
         entering.append(window)
         defer { entering.removeAll { CFEqual($0, window) } }
@@ -950,44 +1345,102 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let id = app?.bundleIdentifier, let home = homes.removeValue(forKey: id) { await place(window, at: home.origin) }
         guard let home = frame(of: window) else { return }
         let id = windowID(of: window)
-        let standIn = StandIn(screen: screen, over: home, image: await picture(of: id), title: app?.localizedName ?? "")
-        // The way in plays first, since a display coming online meanwhile would stall it. The
-        // window stays behind, on the Space it slides away with.
-        guard await standIn.enter(), let stage = await openStage(on: screen) else {
-            standIn.close()
-            return giveUp(window)
+        let image = await picture(of: id)
+        // The display comes online first, before anything shows: it moves windows about as it does,
+        // and would stall an animation. Then the window goes full screen there while the stand-in
+        // grows into its Space.
+        guard let stage = await openStage(on: screen, sized: sized) else { return giveUp(window, sized: sized) }
+        let standIn = StandIn(screen: screen, over: home, image: image, title: app?.localizedName ?? "")
+        async let entered = standIn.enter()
+        if sized {
+            if stage.top == 0 {
+                // macOS keeps the window below this display's menu bar: where it ends up is where the
+                // picture starts.
+                setSize(window, stage.panel.size)
+                move(window, to: stage.bounds.origin)
+                try? await Task.sleep(for: .milliseconds(60))
+                let menuBar = NSScreen.screens.first { $0.displayID == stage.id }.map { $0.frame.maxY - $0.visibleFrame.maxY } ?? 0
+                stage.top = max(menuBar, (frame(of: window)?.minY ?? stage.bounds.minY) - stage.bounds.minY)
+            }
+            await fit(window, into: stage.shown)
+        } else {
+            await place(window, at: home.origin - stage.panel.origin + stage.bounds.origin)
         }
-        await place(window, at: home.origin - stage.panel.origin + stage.bounds.origin)
-        guard let moved = frame(of: window)?.origin, stage.bounds.contains(moved) else {
+        guard let moved = frame(of: window), sized ? abs(moved.minY - stage.shown.minY) < 2 && abs(moved.height - stage.shown.height) < 2
+                                                   : stage.bounds.contains(moved.origin) else {
+            setSize(window, home.size)
             move(window, to: home.origin)
+            _ = await entered
             standIn.close()
-            return giveUp(window)
+            return giveUp(window, sized: sized)
         }
-        targets.append(Target(pid: pid, app: app?.bundleIdentifier, window: window, id: id, home: home, standIn: standIn))
-        setFullScreen(window, true)
-        // Its way into full screen there plays out of sight.
-        await stage.settle(atLeast: .milliseconds(450), atMost: .milliseconds(700))
+        let titleBar = sized ? TitleBar(CGRect(x: stage.shown.minX, y: stage.shown.minY, width: stage.shown.width, height: TitleBar.height),
+                                        onClose: { element(window, kAXCloseButtonAttribute).map { _ = AXUIElementPerformAction($0, kAXPressAction as CFString) } },
+                                        onLeave: { [weak self] in self?.leave(window) }) : nil
+        titleBar?.title = title(of: window)
+        targets.append(Target(pid: pid, app: app?.bundleIdentifier, window: window, id: id, home: home, standIn: standIn, sized: sized, titleBar: titleBar))
+        if !sized { setFullScreen(window, true) }
+        let started = ContinuousClock.now
+        // No Space for it on the panel: back out.
+        if await !entered { release(window) }
+        // Its own way into full screen there, out of sight, takes about this long.
+        try? await Task.sleep(until: started.advanced(by: .milliseconds(sized ? 100 : 550)), clock: .continuous)
+        // Nothing to show it with: back out.
+        if await stage.capturing?.value != true { release(window) }
         entering.removeAll { CFEqual($0, window) }
         if standIn.isCurrent { focus(window, pid: pid) }
         update()
     }
 
-    /// The app won't move, so it gets plain full screen.
-    private func giveUp(_ window: AXUIElement) {
+    /// The app won't move, so it gets what its green button would have done.
+    private func giveUp(_ window: AXUIElement, sized: Bool) {
         ignored.append(window)
-        setFullScreen(window, true)
+        if sized {
+            element(window, kAXZoomButtonAttribute).map { _ = AXUIElementPerformAction($0, kAXPressAction as CFString) }
+        } else {
+            setFullScreen(window, true)
+        }
         entering.removeAll { CFEqual($0, window) }
         update()
     }
 
-    private func openStage(on screen: NSScreen) async -> Stage? {
+    /// Takes a window out of true full screen: out of full screen on the stage, which brings it home,
+    /// or for one sized to fill, home directly.
+    private func release(_ window: AXUIElement) {
+        guard let target = targets.first(where: { CFEqual($0.window, window) }) else { return }
+        if target.sized { leave(window) } else { setFullScreen(window, false) }
+    }
+
+    private func leave(_ window: AXUIElement) {
+        guard let index = targets.firstIndex(where: { CFEqual($0.window, window) }), !targets[index].leaving else { return }
+        targets[index].leaving = true
+        let target = targets[index]
+        Task { await bringHome(target) }
+    }
+
+    private func openStage(on screen: NSScreen, sized: Bool) async -> Stage? {
         while opening || closing { try? await Task.sleep(for: .milliseconds(10)) }
-        if let stage { return stage }
+        // One kind at a time: windows sized to fill need a taller stage than full screen ones.
+        if let stage { return (stage.extra > 0) == sized ? stage : nil }
         opening = true
         defer { opening = false }
-        guard let made = await Stage.open(on: screen, serial: serial) else { return nil }
+        guard let made = await Stage.open(on: screen, serial: serial, extra: sized ? 64 : 0) else { return nil }
         made.onFrame = { [weak self] buffer in self?.targets.forEach { $0.standIn.setLive(buffer) } }
-        made.onSwipe = { [weak self] on in self?.swiped(on) }
+        made.onExitKey = { [weak self] in
+            guard let self, let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                  let target = targets.first(where: { $0.sized && !$0.leaving && $0.pid == front && $0.standIn.isCurrent }) else { return false }
+            leave(target.window)
+            return true
+        }
+        made.onOffset = { [weak self, weak made] in
+            guard let self, let made else { return }
+            for target in targets {
+                target.standIn.picture = made.picture(over: target.standIn.full)
+                // Out with the menu bar, which is out when the picture starts at the very top.
+                target.titleBar?.show(made.offset == 0)
+            }
+        }
+        made.onSwipe = { [weak self] on, vertical in self?.swiped(on, vertical: vertical) }
         defaults.set(true, forKey: "staged")
         stage = made
         return made
@@ -1005,7 +1458,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             try? await Task.sleep(for: .milliseconds(700))
             entering.removeAll { CFEqual($0, window) }
-            await takeOver(window, pid: app.processIdentifier)
+            await takeOver(window, pid: app.processIdentifier, sized: false)
         }
     }
 
@@ -1015,6 +1468,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         target.standIn.hold()
         stage?.hold(pointer: false)
         async let left = target.standIn.leave(to: target.home)
+        if target.sized { setSize(target.window, target.home.size) }
         for _ in 0..<30 {
             if let size = frame(of: target.window)?.size, abs(size.width - target.home.width) < 2,
                abs(size.height - target.home.height) < 2 { break }
@@ -1035,7 +1489,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             AXUIElementSetAttributeValue(target.window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
         focus(target.window, pid: target.pid)
-        target.standIn.close()
+        target.close()
         targets.removeAll { CFEqual($0.window, target.window) }
         update()
     }
@@ -1118,13 +1572,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for target in targets where frame(of: target.window) == nil {
             // Closed, or its app quit: its Space goes with it.
             if NSRunningApplication(processIdentifier: target.pid) == nil, let app = target.app { homes[app] = target.home }
-            target.standIn.close()
+            target.close()
         }
         targets.removeAll { frame(of: $0.window) == nil }
-        for index in targets.indices where !targets[index].leaving && !isFullScreen(targets[index].window) {
-            targets[index].leaving = true
-            let target = targets[index]
-            Task { await bringHome(target) }
+        for target in targets where !target.sized && !target.leaving && !isFullScreen(target.window) {
+            leave(target.window)
         }
         adoptFullScreenWindow()
 
@@ -1132,34 +1584,46 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A window moved to another display from its green button menu stays there.
         for target in targets where !target.leaving && frame(of: target.window).map({ !$0.intersects(stage.bounds) }) == true {
             ignored.append(target.window)
-            target.standIn.close()
+            target.close()
             targets.removeAll { CFEqual($0.window, target.window) }
         }
         sweep(stage)
         if targets.isEmpty { return close(stage) }
 
+        if !missionControl, missionControlIsOpen() { missionControlOpened(late: true) }
+        refreshOpenings()
         // The stage is shown only while it shows the window: a Space change or Mission Control
         // there is never seen.
         var live: Target?
-        if !missionControl, !swiping, let current = targets.first(where: { !$0.leaving && $0.standIn.isCurrent }) {
+        if !missionControl, let current = targets.first(where: { !$0.leaving && $0.standIn.isCurrent }) {
             // Its Space coming up hands the keyboard to this app: pass it on.
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() || !stage.isShowing(current.id) {
+            if !swiping, NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() || !stage.isShowing(current.id) {
                 focus(current.window, pid: current.pid)
             }
             if stage.isShowing(current.id) { live = current }
         }
         for target in targets {
-            if let live, CFEqual(live.window, target.window) { target.standIn.goLive() } else { target.standIn.hold() }
+            target.titleBar?.title = title(of: target.window)
+            if let live, CFEqual(live.window, target.window) {
+                target.standIn.picture = stage.picture(over: target.standIn.full)
+                target.standIn.goLive()
+                if let frame = stage.latest { target.standIn.setLive(frame) }
+            } else {
+                target.standIn.hold()
+            }
         }
-        stage.hold(pointer: live != nil)
+        // The pointer stays on the panel through a swipe, where the Dock looks for it.
+        stage.hold(pointer: live != nil && !swiping)
     }
 
-    private func swiped(_ on: Bool) {
+    /// A swipe between Spaces moves the panel's, leaving the stage as it is: the picture stays live.
+    /// Up or down brings Mission Control or App Exposé, which the stage would show too.
+    private func swiped(_ on: Bool, vertical: Bool) {
         swiping = on
-        if on {
-            targets.forEach { $0.standIn.hold() }
-        } else {
-            // Once the Space it led to has come up.
+        if on, vertical {
+            missionControlOpened(late: false)
+        } else if !on {
+            // A cancelled swipe leaves the Space as it was, with nothing else to say so.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.update() }
         }
     }
@@ -1169,33 +1633,57 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Mission Control shows the panel's Spaces, the stand-ins' among them, so let the pointer
     /// go there and keep the stage's own Mission Control out of the picture.
     fileprivate func windowsChanged() {
-        guard !checking, !missionControl, !closing, targets.contains(where: \.standIn.isLive) else { return }
-        // One look per burst of window changes.
+        guard !checking, !closing, stage != nil else { return }
+        // One look per burst of window changes: each asks WindowServer, which has animations to draw.
         checking = true
-        DispatchQueue.main.async { [self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
             checking = false
-            guard !missionControl, missionControlIsOpen() else { return }
-            missionControlOpened()
+            if missionControl { return checkMissionControl() }
+            refreshOpenings()
+            if missionControlIsOpen() { missionControlOpened(late: true) }
         }
     }
 
-    private func missionControlOpened() {
+    /// Other apps' windows on the panel (notifications, alerts, the Dock), which can only be over
+    /// the stand-ins, there being nothing else in their Spaces.
+    private func refreshOpenings() {
+        guard let stage else { return }
+        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+        stage.openings = windows.compactMap { info in
+            guard info[kCGWindowOwnerPID as String] as? pid_t != getpid(), info[kCGWindowOwnerName as String] as? String != "Window Server",
+                  (info[kCGWindowLayer as String] as? Int ?? -1) >= 0, (info[kCGWindowAlpha as String] as? Double ?? 0) > 0,
+                  let rect = (info[kCGWindowBounds as String] as! CFDictionary?).flatMap(CGRect.init(dictionaryRepresentation:)),
+                  rect.intersects(stage.panel) else { return nil }
+            return rect.intersection(stage.panel)
+        }
+    }
+
+    /// Freezes the stand-ins and lets the pointer go to the panel. `late` when Mission Control was
+    /// already up, and the stage's own may have made it into the last frame.
+    private func missionControlOpened(late: Bool) {
+        guard !missionControl else { return }
         missionControl = true
+        missionControlSince = Date()
+        targets.forEach { $0.standIn.hideBand() }
         for target in targets where target.standIn.isLive {
             target.standIn.hold()
-            Task { if let image = await picture(of: target.id) { target.standIn.cover(image) } }
+            if late { Task { if let image = await picture(of: target.id) { target.standIn.cover(image) } } }
         }
         stage?.hold(pointer: false)
-        missionControlTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        stage?.idle(true)
+        // Its windows going away says when it's over; this is in case that's missed.
+        missionControlTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkMissionControl() }
         }
     }
 
     private func checkMissionControl() {
-        guard !missionControlIsOpen() else { return }
+        // A swipe up gets here before Mission Control's windows do, and nothing is asked while it opens.
+        guard !swiping, Date().timeIntervalSince(missionControlSince) > 0.4, !missionControlIsOpen() else { return }
         missionControl = false
         missionControlTimer?.invalidate()
         missionControlTimer = nil
+        stage?.idle(false)
         update()
     }
 
@@ -1246,7 +1734,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() {
         enabled.toggle()
         item.button?.image = glyph(on: enabled)
-        if !enabled { targets.forEach { setFullScreen($0.window, false) } }
+        if !enabled { targets.forEach { release($0.window) } }
     }
 
     @objc private func toggleApp(_ sender: NSMenuItem) {

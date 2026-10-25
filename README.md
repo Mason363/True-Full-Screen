@@ -22,14 +22,14 @@ Press the green button as usual. The menu bar and traffic lights still slide in 
 
 ## How
 
-The window moves to a notch-free virtual display the size of your screen, goes full screen there, and that display is shown on yours edge to edge. Nothing runs until a window goes full screen. Inspired by [MacNotchKiller](https://github.com/DTW7607/MacNotchKiller).
+The window moves to a notch-free virtual display the size of your screen and goes full screen there. On your screen, a full screen window of the app's own takes its place, in a Space of its own, and shows that display edge to edge. Nothing runs until a window goes full screen. Inspired by [MacNotchKiller](https://github.com/DTW7607/MacNotchKiller).
 
 ## Notes
 
 - Needs Accessibility and Screen Recording.
 - macOS shows its screen-recording dot while an app is in true full screen.
-- Mission Control and swipes show your other Spaces. ⌘Tab gets you back.
-- Idle: 0% CPU, ~15 MB.
+- Mission Control, swipes and ⌘Tab work as with any full screen app. Its Space is labeled True Full Screen.
+- Idle: 0% CPU, under 30 MB.
 - Uses private macOS APIs. Tested on macOS 27.
 
 ## Build

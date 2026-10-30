@@ -125,13 +125,18 @@ private func hiddenWindow(_ id: CGWindowID, of pid: pid_t) -> AXUIElement? {
 }
 
 /// Hands a window the keyboard, along with its app. Through Accessibility too, which works from
-/// behind another app, where asking the app to come forward may not.
+/// behind another app, where asking the app to come forward may not. Asked on a queue of its own,
+/// in order: an app still busy going full screen can take a while to answer.
 private func focus(_ window: AXUIElement, pid: pid_t) {
     NSRunningApplication(processIdentifier: pid)?.activate()
-    AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-    AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-    AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    focusing.async {
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
 }
+
+private let focusing = DispatchQueue(label: "TrueFullScreen.focus", qos: .userInteractive)
 
 private func isFocused(_ window: AXUIElement, pid: pid_t) -> Bool {
     element(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute).map { CFEqual($0, window) } ?? false
@@ -145,6 +150,10 @@ private func place(_ window: AXUIElement, at point: CGPoint) async {
         if let origin = frame(of: window)?.origin, abs(origin.x - point.x) < 2, abs(origin.y - point.y) < 2 { return }
     }
 }
+
+/// Asks an app something off the main thread, which draws the stand-ins' way in and out and would
+/// stall while an app busy moving its window took its time to answer.
+private func apart<Result>(_ body: () -> Result) async -> Result { body() }
 
 /// Returns once an app answers, which it does from its main thread, so once it's through whatever
 /// reached it before. Asked off the main thread here, which a slow app would otherwise hold up.
@@ -274,6 +283,10 @@ private let moveWindow = dlsym(skyLight, "SLSMoveWindow")
     .map { unsafeBitCast($0, to: (@convention(c) (Int32, UInt32, UnsafeMutablePointer<CGPoint>) -> Int32).self) }
 private let setWindowAlpha = dlsym(skyLight, "SLSSetWindowAlpha")
     .map { unsafeBitCast($0, to: (@convention(c) (Int32, UInt32, Float) -> Int32).self) }
+private let managedDisplayCurrentSpace = dlsym(skyLight, "SLSManagedDisplayGetCurrentSpace")
+    .map { unsafeBitCast($0, to: (@convention(c) (Int32, CFString) -> UInt64).self) }
+private let managedDisplayIsAnimating = dlsym(skyLight, "SLSManagedDisplayIsAnimating")
+    .map { unsafeBitCast($0, to: (@convention(c) (Int32, CFString) -> Bool).self) }
 
 /// The Spaces any of the windows are on.
 private func spaces(of windows: [CGWindowID]) -> Set<Int> {
@@ -293,24 +306,23 @@ private func spaces(on display: CGDirectDisplayID) -> Set<Int> {
 }
 
 /// The Space a display is showing, as the window server has it, which is right even partway
-/// through a switch, as asking a window whether it's on the active Space isn't.
+/// through a switch, as asking a window whether it's on the active Space isn't. Asked directly,
+/// a few microseconds each time, so it's never a moment out of date.
 private func currentSpace(on display: CGDirectDisplayID) -> Int? {
-    // Asked several times over each time the state's looked at: once will do.
-    let now = CFAbsoluteTimeGetCurrent()
-    if let cached = spaceCache[display], now - cached.at < 0.03 { return cached.space }
-    let space = lookUpCurrentSpace(on: display)
-    spaceCache[display] = (space, now)
-    return space
-}
-
-/// The main thread's.
-private var spaceCache: [CGDirectDisplayID: (space: Int?, at: CFAbsoluteTime)] = [:]
-
-private func lookUpCurrentSpace(on display: CGDirectDisplayID) -> Int? {
-    guard let id = identifier(of: display),
-          let displays = copyManagedDisplaySpaces?(connection)?.takeRetainedValue() as? [[String: Any]],
+    guard let id = identifier(of: display) else { return nil }
+    if let managedDisplayCurrentSpace {
+        let space = managedDisplayCurrentSpace(connection, id as CFString)
+        return space == 0 ? nil : Int(space)
+    }
+    guard let displays = copyManagedDisplaySpaces?(connection)?.takeRetainedValue() as? [[String: Any]],
           let match = displays.first(where: { $0["Display Identifier"] as? String == id }) else { return nil }
     return (match["Current Space"] as? [String: Any])?["ManagedSpaceID"] as? Int
+}
+
+/// Whether a display is partway through moving between Spaces: its picture then shows the move.
+private func isSwitchingSpaces(_ display: CGDirectDisplayID) -> Bool {
+    guard let managedDisplayIsAnimating, let id = identifier(of: display) else { return false }
+    return managedDisplayIsAnimating(connection, id as CFString)
 }
 
 /// Waits for a window moved to a display to join one of its Spaces, which macOS does a moment
@@ -322,10 +334,10 @@ private func settled(_ window: CGWindowID, on display: CGDirectDisplayID, from b
         try? await Task.sleep(for: .milliseconds(150))
         return true
     }
-    for _ in 0..<50 {
+    for _ in 0..<200 {
         let now = spaces(of: [window]), there = spaces(on: display)
         if there.isEmpty ? !now.isEmpty && now.isDisjoint(with: before) : !now.isDisjoint(with: there) { return true }
-        try? await Task.sleep(for: .milliseconds(20))
+        try? await Task.sleep(for: .milliseconds(5))
     }
     return false
 }
@@ -499,7 +511,7 @@ final class PinnedWindow: NSWindow {
 }
 
 private let quiet: [String: CAAction] = ["contents": NSNull(), "opacity": NSNull(), "bounds": NSNull(),
-                                         "position": NSNull(), "frame": NSNull()]
+                                         "position": NSNull(), "frame": NSNull(), "backgroundColor": NSNull()]
 
 /// This app's own full screen window on the panel, standing in for a window on the stage. It gets
 /// a Space of its own like any full screen window, so Spaces, swipes and Mission Control treat it as
@@ -514,6 +526,9 @@ final class StandIn: NSObject, NSWindowDelegate {
     /// Where macOS lets a full screen window be: below the notch.
     private var safe: NSRect
     private var home: NSRect
+    /// Black, as full screen is, but clear while it's the size of the window: the app's rounded
+    /// corners, whatever their radius, then show what's behind them, as the window's own do.
+    private let backdrop = CALayer()
     private let still = CALayer()
     private let live = CALayer()
     private let band: PinnedWindow
@@ -548,14 +563,16 @@ final class StandIn: NSObject, NSWindowDelegate {
         window.animationBehavior = .none
         window.isReleasedWhenClosed = false
         window.hasShadow = false
-        window.backgroundColor = .black
         window.delegate = self
         let view = NSView()
         view.wantsLayer = true
-        view.layer?.backgroundColor = .black
         view.layer?.masksToBounds = true
         window.contentView = view
-        for layer in [live, still] {
+        // Right over the window to begin with, and the same: clear around its picture.
+        showBehind(true)
+        backdrop.backgroundColor = .black
+        backdrop.isOpaque = true
+        for layer in [backdrop, live, still] {
             layer.actions = quiet
             layer.frame = view.bounds
             layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
@@ -628,8 +645,14 @@ final class StandIn: NSObject, NSWindowDelegate {
         }
     }
 
+    /// How many stand-ins are on their way in or out of full screen, an animation the main thread draws.
+    private(set) static var moving = 0
+    /// Called once none is.
+    static var onStill: (() -> Void)?
+
     /// Waits on a transition, giving up after a while: only on this one, not one that comes after.
     private func start(_ done: CheckedContinuation<Bool, Never>) {
+        if transition == nil { Self.moving += 1 }
         transition = done
         transitions += 1
         let current = transitions
@@ -645,22 +668,41 @@ final class StandIn: NSObject, NSWindowDelegate {
     }
 
     private func finish(_ done: Bool) {
-        transition?.resume(returning: done)
-        transition = nil
+        guard let transition else { return }
+        self.transition = nil
+        transition.resume(returning: done)
+        Self.moving -= 1
+        if Self.moving == 0 { DispatchQueue.main.async { Self.onStill?() } }
     }
 
     /// Fades in the window's own picture, as it is out of full screen, for the end of the way out.
+    /// Once it's in, nothing else shows around its rounded corners.
     func land(_ image: CGImage) {
         still.contents = image
         still.contentsGravity = .resize
+        still.backgroundColor = nil
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.2)
+        CATransaction.setCompletionBlock { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.still.opacity == 1, !self.isLive else { return }
+                self.live.opacity = 0
+                self.showBehind(true)
+            }
+        }
         still.opacity = 1
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0
         fade.toValue = 1
         still.add(fade, forKey: "opacity")
         CATransaction.commit()
+    }
+
+    /// Clears the window around its picture, or makes it solid black, as it is in full screen.
+    private func showBehind(_ on: Bool) {
+        window.isOpaque = !on
+        window.backgroundColor = on ? .clear : .black
+        backdrop.opacity = on ? 0 : 1
     }
 
     /// Keeps the last frame, while the stage shows something that isn't the window. The band stays,
@@ -671,9 +713,26 @@ final class StandIn: NSObject, NSWindowDelegate {
         feed?.detach(sink)
     }
 
-    /// Hides the band, for Mission Control, which would show it over everything, or shows it again.
-    /// Left in its Space either way, so it's back the moment Mission Control is gone.
-    func showBand(_ on: Bool) { band.alphaValue = on ? 1 : 0 }
+    /// Whether a window is in front of it on the screen.
+    func isCovered(by id: CGWindowID) -> Bool {
+        guard id != 0, window.isVisible else { return true }
+        let above = CGWindowListCopyWindowInfo(.optionOnScreenAboveWindow, CGWindowID(window.windowNumber)) as? [[String: Any]] ?? []
+        return above.contains { $0[kCGWindowNumber as String] as? CGWindowID == id }
+    }
+
+    /// Hides the band, for Mission Control, which would show it over everything, or shows it again,
+    /// fading in once Mission Control is gone. Left in its Space either way.
+    func showBand(_ on: Bool, fading: Bool = false) {
+        let alpha: CGFloat = on ? 1 : 0
+        guard fading, band.isVisible, band.alphaValue != alpha else {
+            band.alphaValue = alpha
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            band.animator().alphaValue = alpha
+        }
+    }
 
     /// Shows the window's own picture instead, in case the last frame caught something else, and
     /// without the pointer, which is elsewhere by then.
@@ -698,7 +757,7 @@ final class StandIn: NSObject, NSWindowDelegate {
     }
 
     private func layout() {
-        guard isFullScreen else { return }
+        guard isFullScreen, shrinking == nil else { return }
         live.autoresizingMask = []
         let inWindow = picture.offsetBy(dx: -window.frame.minX, dy: -window.frame.minY)
         let inBand = picture.offsetBy(dx: -band.frame.minX, dy: -band.frame.minY)
@@ -710,7 +769,6 @@ final class StandIn: NSObject, NSWindowDelegate {
     func goLive() {
         showBand(true)
         pin()
-        // Ordered in while its Space is up, which puts it in that Space.
         // Ordered in while its Space is up, which puts it in that Space, and only then: one that
         // ended up in another stand-in's Space would show this one's picture there.
         let space = currentSpace(on: panelID)
@@ -718,19 +776,27 @@ final class StandIn: NSObject, NSWindowDelegate {
         if !band.isVisible, window.frame.maxY < full.maxY, isIn(space) { band.orderFrontRegardless() }
         guard !isLive else { return }
         isLive = true
+        if isFullScreen, !window.isOpaque { showBehind(false) }
         feed?.attach(sink)
-        guard still.opacity > 0 else { return }
+        guard still.opacity > 0 else {
+            live.opacity = 1
+            return
+        }
+        // The still fades out over the picture, there in full beneath it from the start: both fading
+        // at once would let the black behind them show through, a quarter of it halfway.
+        still.backgroundColor = .black
+        live.opacity = 1
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.2)
-        CATransaction.setCompletionBlock { [still] in still.contents = nil }
-        live.opacity = 1
-        still.opacity = 0
-        for (layer, from, to) in [(live, 0, 1), (still, 1, 0)] {
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = from
-            fade.toValue = to
-            layer.add(fade, forKey: "opacity")
+        CATransaction.setCompletionBlock { [still] in
+            still.contents = nil
+            still.backgroundColor = nil
         }
+        still.opacity = 0
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        still.add(fade, forKey: "opacity")
         CATransaction.commit()
     }
 
@@ -754,6 +820,15 @@ final class StandIn: NSObject, NSWindowDelegate {
     func customWindowsToEnterFullScreen(for window: NSWindow) -> [NSWindow]? { [window] }
 
     func window(_ window: NSWindow, startCustomAnimationToEnterFullScreenOn screen: NSScreen, withDuration duration: TimeInterval) {
+        enterDuration = duration
+        // Black comes in around the picture as it starts to grow: only its very first frames are
+        // the size of the window.
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.toValue = 1
+        fade.duration = duration / 4
+        backdrop.opacity = 1
+        backdrop.add(fade, forKey: "opacity")
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0, 0.1, 1)
@@ -761,7 +836,11 @@ final class StandIn: NSObject, NSWindowDelegate {
         }
     }
 
+    /// How long the way in took, for the log.
+    private(set) var enterDuration: TimeInterval = 0
+
     func windowDidEnterFullScreen(_ notification: Notification) {
+        showBehind(false)
         layout()
         finish(true)
     }
@@ -771,12 +850,21 @@ final class StandIn: NSObject, NSWindowDelegate {
     func customWindowsToExitFullScreen(for window: NSWindow) -> [NSWindow]? { [window] }
 
     func window(_ window: NSWindow, startCustomAnimationToExitFullScreenWithDuration duration: TimeInterval) {
-        band.orderOut(nil)
-        // The whole picture shrinks with the window.
-        for layer in [live, still] {
-            layer.frame = window.contentView?.bounds ?? layer.frame
-            layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        // The strip above goes dark, as a full screen window's does on its way out.
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = min(0.15, duration / 2)
+            band.animator().alphaValue = 0
+        }, completionHandler: { [band] in band.orderOut(nil) })
+        // The picture shrinks with the window from just where it is, the part that showed above the
+        // window staying above it, so its first frame on the way out is its last one in full screen.
+        let bounds = window.contentView?.bounds ?? .zero
+        if bounds.width > 0, bounds.height > 0 {
+            shrinking = CGRect(x: live.frame.minX / bounds.width, y: live.frame.minY / bounds.height,
+                               width: live.frame.width / bounds.width, height: live.frame.height / bounds.height)
         }
+        live.autoresizingMask = []
+        still.frame = bounds
+        still.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0, 0.1, 1)
@@ -784,7 +872,19 @@ final class StandIn: NSObject, NSWindowDelegate {
         }
     }
 
-    func windowDidExitFullScreen(_ notification: Notification) { finish(true) }
+    /// Where the picture sits in the window on the way out, as a share of the window's size.
+    private var shrinking: CGRect?
+
+    func windowDidResize(_ notification: Notification) {
+        guard let shrinking, let bounds = window.contentView?.bounds else { return }
+        live.frame = CGRect(x: shrinking.minX * bounds.width, y: shrinking.minY * bounds.height,
+                            width: shrinking.width * bounds.width, height: shrinking.height * bounds.height)
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        shrinking = nil
+        finish(true)
+    }
 
     func windowDidFailToExitFullScreen(_ window: NSWindow) { finish(false) }
 }
@@ -810,8 +910,12 @@ final class Sprite: @unchecked Sendable {
     private var wanted = false
     private var hidden = false
     private var alpha: Float = -1
-    // The main thread's.
+    /// The look on show, by the system's count of pointer changes, and whether the main thread has
+    /// been asked to take on a newer one, or the pointer thread to look again in a moment.
     private var seed = UInt32.max
+    private var asked = false
+    private var looking = false
+    // The main thread's.
     private var timer: Timer?
 
     @MainActor init() {
@@ -833,7 +937,11 @@ final class Sprite: @unchecked Sendable {
     /// Puts it up to follow the pointer, or takes it down.
     @MainActor func run(_ on: Bool) {
         if on, timer == nil {
+            lock.lock()
             seed = .max
+            asked = false
+            hidden = cursorIsVisible?() == 0
+            lock.unlock()
             refresh()
             window.orderFrontRegardless()
             lock.lock()
@@ -841,8 +949,8 @@ final class Sprite: @unchecked Sendable {
             alpha = -1
             lock.unlock()
             apply()
-            // Its look can change while it stands still: typing hides it, apps swap it.
-            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }
+            // Its look can change while it stands still too: typing hides it, apps swap it.
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.look() }
             RunLoop.main.add(timer, forMode: .common)
             self.timer = timer
         } else if !on, timer != nil {
@@ -866,6 +974,9 @@ final class Sprite: @unchecked Sendable {
         if id != 0 { _ = moveWindow?(connection, id, &origin) }
         applyLocked()
         lock.unlock()
+        // Moved onto something with a pointer of its own, a link or text, say.
+        look()
+        lookSoon()
     }
 
     func hide() {
@@ -888,14 +999,44 @@ final class Sprite: @unchecked Sendable {
         _ = setWindowAlpha?(connection, id, target)
     }
 
-    /// Takes on the pointer's current look, size and visibility.
-    @MainActor private func refresh() {
+    /// Follows the pointer's visibility, and has the main thread take on a new look. From any
+    /// thread, as often as it likes: both questions take microseconds.
+    func look() {
         lock.lock()
+        defer { lock.unlock() }
+        guard id != 0 else { return }
         hidden = cursorIsVisible?() == 0
         applyLocked()
+        guard !asked, let current = currentCursorSeed?(), current != seed else { return }
+        asked = true
+        DispatchQueue.main.async { MainActor.assumeIsolated { self.refresh() } }
+    }
+
+    /// Looks again in a moment: an app changes the pointer once it has the event that moved it, and
+    /// hides it once it has a key.
+    func lookSoon() {
+        lock.lock()
+        guard id != 0, !looking else { return lock.unlock() }
+        looking = true
         lock.unlock()
-        guard let current = currentCursorSeed?(), current != seed else { return }
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(12)) { [self] in
+            lock.lock()
+            looking = false
+            lock.unlock()
+            look()
+        }
+    }
+
+    /// Takes on the pointer's current look and size.
+    @MainActor private func refresh() {
+        lock.lock()
+        asked = false
+        // Counted before it's read: a change in between is seen next time.
+        let current = currentCursorSeed?() ?? 0
+        let changed = current != seed
         seed = current
+        lock.unlock()
+        guard changed else { return }
         let cursor = NSCursor.currentSystem ?? .arrow
         var scale: Float = 1
         _ = getCursorScale?(connection, &scale)
@@ -1210,6 +1351,8 @@ final class Fence: @unchecked Sendable {
         lock.lock()
         let confined = confined, armed = exitArmed
         lock.unlock()
+        // Typing hides the pointer.
+        if confined { sprite.lookSoon() }
         // ⌃⌘F, the way out of full screen, which a window sized to fill has none of.
         if armed, modifiers == [.maskControl, .maskCommand], code == 3 {
             notify { $0.fenceExitKey() }
@@ -1408,7 +1551,6 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
     private var configuration: SCStreamConfiguration?
     private var interval = CMTime.zero
     private let frames = DispatchQueue(label: "TrueFullScreen.frames", qos: .userInteractive)
-    private let born = ContinuousClock.now
 
     static func open(on screen: NSScreen, serial: UInt32, extra: Int) async -> Stage? {
         guard let mode = CGDisplayCopyDisplayMode(screen.displayID) else { return nil }
@@ -1444,8 +1586,8 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
         guard let display = made else { return nil }
 
         let id = display.displayID
-        for _ in 0..<200 where CGDisplayIsActive(id) == 0 {
-            try? await Task.sleep(for: .milliseconds(5))
+        for _ in 0..<500 where CGDisplayIsActive(id) == 0 {
+            try? await Task.sleep(for: .milliseconds(2))
         }
         guard CGDisplayIsActive(id) != 0 else { return nil }
 
@@ -1458,9 +1600,10 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
             CGConfigureDisplayOrigin(config, id, Int32(others.maxX), Int32(others.maxY))
             CGCompleteDisplayConfiguration(config, .forSession)
         }
-        // Every app learns of the display in its own time; this one knowing it, in place, is the earliest.
-        for _ in 0..<100 where !NSScreen.screens.contains(where: { $0.displayID == id && $0.frame == appKit(CGDisplayBounds(id)) }) {
-            try? await Task.sleep(for: .milliseconds(10))
+        // In place once it has a Space of its own: a stand-in can start growing then, the display no
+        // longer moving anything about. Apps learn of it a while later.
+        for _ in 0..<500 where currentSpace(on: id) == nil {
+            try? await Task.sleep(for: .milliseconds(2))
         }
 
         let stage = Stage(display: display, panel: screen.displayID, extra: CGFloat(extra),
@@ -1484,7 +1627,18 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
         super.init()
         fence.delegate = self
         fence.install()
+        // Every app learns of the display in its own time; this one knowing it, in place, is the earliest.
+        let id = id
+        known = Task {
+            for _ in 0..<500 where !NSScreen.screens.contains(where: { $0.displayID == id && $0.frame == appKit(CGDisplayBounds(id)) }) {
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            return .now
+        }
     }
+
+    /// When this app learned of the display.
+    private var known: Task<ContinuousClock.Instant, Never>?
 
     /// Starts the live picture, unless it's running already.
     func startCapture() {
@@ -1561,6 +1715,7 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
     /// Waits until an app has surely caught up with the display coming online: a window landing on
     /// a display its app doesn't know yet can bring the app down.
     func settle(_ pid: pid_t) async {
+        let born = await known?.value ?? .now
         try? await Task.sleep(until: born.advanced(by: .milliseconds(300)), clock: .continuous)
         await caughtUp(pid)
     }
@@ -1572,6 +1727,19 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
 
     /// The part of the stage the panel shows.
     var shown: CGRect { fence.shown }
+
+    /// Whether the display is partway through moving between Spaces, which its picture would show.
+    var isSwitching: Bool { isSwitchingSpaces(id) }
+
+    /// Whether the display is all the way in a window's Space. The Space it shows changes only once
+    /// a move there is through, whatever brought it about; the window server says it's moving only
+    /// for some.
+    func hasArrived(at window: CGWindowID) -> Bool {
+        guard !isSwitching else { return false }
+        let theirs = spaces(of: [window])
+        guard let space = currentSpace(on: id), !theirs.isEmpty else { return true }
+        return theirs.contains(space)
+    }
 
     /// Where a window sized to fill goes: below the stage's menu bar, whether that's out or not.
     var fill: CGRect { CGRect(x: bounds.minX, y: bounds.minY + top, width: panel.width, height: panel.height) }
@@ -1756,10 +1924,15 @@ private let windowServerEvent: NotifyProc = { _, _, _, info in
 }
 
 /// A target's window moved, resized, closed or retitled, or its app's focus moved.
-private let accessibilityEvent: AXObserverCallback = { _, _, _, info in
+private let accessibilityEvent: AXObserverCallback = { _, element, notification, info in
     guard let info else { return }
     let controller = Unmanaged<Controller>.fromOpaque(info).takeUnretainedValue()
-    MainActor.assumeIsolated { controller.soon() }
+    let resized = notification as String == kAXResizedNotification
+    MainActor.assumeIsolated {
+        // A full screen window resizes as it starts out of full screen: the picture holds still at once.
+        if resized { controller.resized(element) }
+        controller.soon()
+    }
 }
 
 // MARK: - Menu bar glyph
@@ -1824,14 +1997,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var entering: [AXUIElement] = []
     private var ignored: [AXUIElement] = [] { didSet { publish() } }
     private var stage: Stage?
-    private var opening = false
-    private var closing = false
+    private var opening = false { didSet { if !opening { stageSettled() } } }
+    private var closing = false { didSet { if !closing { stageSettled() } } }
+    /// Waiting for the stage to be through coming or going.
+    private var settling: [CheckedContinuation<Void, Never>] = []
     /// The stage on its way out wanted again (true), or in the way of a new one (false).
     private var wanted: Bool?
+    /// The wait on its way out, cut short when it's wanted again.
+    private var lingering: Task<Void, Never>?
     private var terminating = false
     private var missionControl = false
     private var swiping = false
     private var checking = false
+    private var nextLook = DispatchTime(uptimeNanoseconds: 0)
+    private var lookDue = false
+    private var updateDue = false
     private var pending = false
     private var missionControlTimer: Timer?
     private var missionControlSince = Date.distantPast
@@ -1843,7 +2023,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// A stand-in whose Space is on its way up, until when: nothing is handed back to the one before.
     private var revealing: (window: AXUIElement, until: Date)?
     private var nextFocus = Date.distantPast
+    private var lastFocus: (window: AXUIElement, at: Date)?
     private var nextSweep = Date.distantPast
+    /// Since when the stage has been moving between Spaces, and whether a look is due once it's through.
+    private var switchingSince: Date?
+    private var followDue = false
     /// Windows on the stage being looked for, and ones that couldn't be found, until when.
     private var rescuing: Set<CGWindowID> = []
     private var unfound: [CGWindowID: Date] = [:]
@@ -1896,6 +2080,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             MainActor.assumeIsolated { _ = Task { await self?.takeOver(window, pid: pid, sized: sized) } }
         }
         clicks.onLeave = { [weak self] window in MainActor.assumeIsolated { self?.leave(window, "green button") } }
+        StandIn.onStill = { [weak self] in
+            MainActor.assumeIsolated {
+                if self?.updateDue == true { self?.update() }
+            }
+        }
         publish()
         clicks.install()
 
@@ -2028,6 +2217,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !terminating, !isBusy(window), let screen = NSScreen.notched else { return }
         entering.append(window)
         defer { entering.removeAll { CFEqual($0, window) } }
+        let clicked = ContinuousClock.now
+        let elapsed = { "\(Int(clicked.duration(to: .now) / .milliseconds(1))) ms" }
         let app = NSRunningApplication(processIdentifier: pid)
         note("take over \(app?.bundleIdentifier ?? "?")\(sized ? ", sized to fill" : "")")
         // Already in the app's own full screen (keyboard, menu): come out of it first.
@@ -2036,30 +2227,36 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let home = frame(of: window) else { return }
         let id = windowID(of: window)
         let before = spaces(of: [id])
-        let image = await picture(of: id)
+        // Pictured meanwhile, off the main thread.
+        async let image = picture(of: id)
         // The display comes online first, before anything shows: it moves windows about as it does,
         // and would stall an animation. Then the window goes full screen there while the stand-in
         // grows into its Space.
         guard let stage = await openStage(on: screen, sized: sized) else { return await giveUp(window, id: id, sized: sized) }
-        let standIn = StandIn(screen: screen, over: home, image: image, title: app?.localizedName ?? "", feed: stage.feed)
+        let standIn = StandIn(screen: screen, over: home, image: await image, title: app?.localizedName ?? "", feed: stage.feed)
+        note("growing after \(elapsed())")
         async let entered = standIn.enter()
         await stage.settle(pid)
         if sized {
             if stage.top == 0 {
                 // macOS keeps the window below this display's menu bar: where it ends up is where the
                 // picture starts.
-                setSize(window, stage.panel.size)
-                move(window, to: stage.bounds.origin)
+                let (size, origin) = (stage.panel.size, stage.bounds.origin)
+                await apart {
+                    setSize(window, size)
+                    move(window, to: origin)
+                }
                 try? await Task.sleep(for: .milliseconds(60))
                 let menuBar = NSScreen.screens.first { $0.displayID == stage.id }.map { $0.frame.maxY - $0.visibleFrame.maxY } ?? 0
-                stage.top = max(menuBar, (frame(of: window)?.minY ?? stage.bounds.minY) - stage.bounds.minY)
+                let top = await apart { frame(of: window)?.minY }
+                stage.top = max(menuBar, (top ?? stage.bounds.minY) - stage.bounds.minY)
             }
             await fit(window, into: stage.fill)
         } else {
             await place(window, at: home.origin - stage.panel.origin + stage.bounds.origin)
         }
-        let moved = frame(of: window).map { sized ? abs($0.minY - stage.fill.minY) < 2 && abs($0.height - stage.fill.height) < 2
-                                                  : stage.bounds.contains($0.origin) } ?? false
+        let moved = await apart { frame(of: window) }.map { sized ? abs($0.minY - stage.fill.minY) < 2 && abs($0.height - stage.fill.height) < 2
+                                                                  : stage.bounds.contains($0.origin) } ?? false
         // Only once it's in a Space there does it go full screen.
         guard moved, await settled(id, on: stage.id, from: before) else {
             note("won't move there: at \(frame(of: window).map { "\($0)" } ?? "?"), Spaces \(spaces(of: [id]))")
@@ -2073,10 +2270,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let titleBar = sized ? TitleBar(CGRect(x: stage.fill.minX, y: stage.fill.minY, width: stage.fill.width, height: TitleBar.height),
                                         onClose: { element(window, kAXCloseButtonAttribute).map { _ = AXUIElementPerformAction($0, kAXPressAction as CFString) } },
                                         onLeave: { [weak self] in self?.leave(window, "title bar") }) : nil
-        titleBar?.title = title(of: window)
+        titleBar?.title = await apart { title(of: window) }
         targets.append(Target(pid: pid, app: app?.bundleIdentifier, window: window, id: id, home: home, standIn: standIn, sized: sized, titleBar: titleBar))
-        observe(window, pid: pid)
+        await observe(window, pid: pid)
         beat(true)
+        let desk = spaces(of: [id])
         let started = ContinuousClock.now
         let went = sized ? true : await goFullScreen(window)
         // No Space for it on the panel, or it won't go full screen there: back out. One that says it
@@ -2084,14 +2282,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let inSpace = await entered
         if !went, fullScreen(window) == false { ignored.append(window) }
         guard went, inSpace else { return leave(window, went ? "no Space on the panel" : "won't go full screen") }
-        // Its own way into full screen there, out of sight, takes about this long.
-        try? await Task.sleep(until: started.advanced(by: .milliseconds(sized ? 100 : 550)), clock: .continuous)
+        // Its own way into full screen there, out of sight, takes at least this long, and lasts until the
+        // display is all the way in the window's own Space, which it shows only once the way in is over.
+        try? await Task.sleep(until: started.advanced(by: .milliseconds(sized ? 100 : 250)), clock: .continuous)
+        let inOwnSpace = { sized || desk.isEmpty || !spaces(of: [id]).isSubset(of: desk) && stage.hasArrived(at: id) }
+        while !inOwnSpace(), started.duration(to: .now) < .seconds(1) {
+            try? await Task.sleep(for: .milliseconds(4))
+        }
         // Nothing to show it with: back out.
         guard await stage.capturing?.value == true else { return leave(window, "no picture") }
         if let index = targets.firstIndex(where: { CFEqual($0.window, window) }) { targets[index].ready = true }
-        note("in true full screen: \(app?.bundleIdentifier ?? "?")")
+        note("in true full screen: \(app?.bundleIdentifier ?? "?") after \(elapsed()), the panel's way in taking \(Int(standIn.enterDuration * 1000)) ms")
         entering.removeAll { CFEqual($0, window) }
-        if standIn.isCurrent { focus(window, pid: pid) }
+        // The picture goes up first: asking the app anything can take a while.
+        follow(now: true)
+        CATransaction.flush()
+        if standIn.isCurrent, !justFocused(window) {
+            lastFocus = (window, Date())
+            focus(window, pid: pid)
+        }
         update()
     }
 
@@ -2125,10 +2334,19 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { await bringHome(target) }
     }
 
+    private func stageSettled() {
+        let settling = settling
+        self.settling = []
+        settling.forEach { $0.resume() }
+    }
+
     private func openStage(on screen: NSScreen, sized: Bool) async -> Stage? {
         // One on its way out stays if it's the right kind, or goes now to make way.
-        if closing, let stage { wanted = (stage.extra > 0) == sized }
-        while opening || closing { try? await Task.sleep(for: .milliseconds(10)) }
+        if closing, let stage {
+            wanted = (stage.extra > 0) == sized
+            lingering?.cancel()
+        }
+        while opening || closing { await withCheckedContinuation { settling.append($0) } }
         // One kind at a time: windows sized to fill need a taller stage than full screen ones.
         if let stage {
             guard (stage.extra > 0) == sized else { return nil }
@@ -2189,9 +2407,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Called back while still full screen there (quitting, switched off, on its way in): out first.
         if !target.sized { await outOfFullScreen(target.window) }
         async let left = target.standIn.leave(to: target.home)
-        if target.sized { setSize(target.window, target.home.size) }
+        if target.sized { await apart { setSize(target.window, target.home.size) } }
         for _ in 0..<30 {
-            if let size = frame(of: target.window)?.size, abs(size.width - target.home.width) < 2,
+            if let size = await apart({ frame(of: target.window)?.size }), abs(size.width - target.home.width) < 2,
                abs(size.height - target.home.height) < 2 { break }
             try? await Task.sleep(for: .milliseconds(30))
         }
@@ -2212,6 +2430,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             AXUIElementSetAttributeValue(target.window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
         focus(target.window, pid: target.pid)
+        // The stand-in goes once the window is in front of it, so nothing behind shows in between.
+        for _ in 0..<40 where !target.standIn.isCovered(by: target.id) {
+            try? await Task.sleep(for: .milliseconds(8))
+        }
+        note("home: in front after \(elapsed())")
         drop(target, "home")
         update()
     }
@@ -2226,18 +2449,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Hears about a target's window moving, resizing, closing or retitling, and its app's focus moving.
-    private func observe(_ window: AXUIElement, pid: pid_t) {
+    private func observe(_ window: AXUIElement, pid: pid_t) async {
         let info = Unmanaged.passUnretained(self).toOpaque()
         if observers[pid] == nil {
             var made: AXObserver?
             guard AXObserverCreate(pid, accessibilityEvent, &made) == .success, let made else { return }
             observers[pid] = made
             CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(made), .commonModes)
-            AXObserverAddNotification(made, AXUIElementCreateApplication(pid), kAXFocusedWindowChangedNotification as CFString, info)
+            await apart { _ = AXObserverAddNotification(made, AXUIElementCreateApplication(pid), kAXFocusedWindowChangedNotification as CFString, info) }
         }
         guard let observer = observers[pid] else { return }
-        for name in [kAXUIElementDestroyedNotification, kAXMovedNotification, kAXResizedNotification, kAXTitleChangedNotification] {
-            AXObserverAddNotification(observer, window, name as CFString, info)
+        await apart {
+            for name in [kAXUIElementDestroyedNotification, kAXMovedNotification, kAXResizedNotification, kAXTitleChangedNotification] {
+                AXObserverAddNotification(observer, window, name as CFString, info)
+            }
         }
     }
 
@@ -2346,7 +2571,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Not with the Dock there, out of sight: it comes back with the display gone.
             var dock = stage.holdsDock
             while wanted == nil, self.stage === stage, !dock, !terminating, since.duration(to: .now) < .seconds(15) {
-                try? await Task.sleep(for: .milliseconds(50))
+                let nap = Task { _ = try? await Task.sleep(for: .milliseconds(50)) }
+                lingering = nap
+                await nap.value
+                lingering = nil
                 // Anything that lands there meanwhile goes back.
                 if lastSweep.duration(to: .now) > .seconds(1) {
                     lastSweep = .now
@@ -2408,6 +2636,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         update()
     }
 
+    /// A target's window resized: out of full screen there, it goes home now rather than in a moment,
+    /// before the stage shows much of its way out.
+    fileprivate func resized(_ window: AXUIElement) {
+        guard let target = targets.first(where: { CFEqual($0.window, window) }), target.ready, !target.sized, !target.leaving,
+              fullScreen(window) == false else { return }
+        leave(window, "out of full screen")
+    }
+
     /// One update for a burst of changes.
     fileprivate func soon() {
         guard !pending else { return }
@@ -2419,6 +2655,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func update() {
+        // The picture follows a Space change at once; the apps are asked about their windows after.
+        follow(now: true)
+        CATransaction.flush()
+        // Not while a stand-in is on its way in or out: asking a busy app would stall it. Once it's there.
+        guard StandIn.moving == 0 else {
+            updateDue = true
+            return
+        }
+        updateDue = false
         for target in targets where isGone(target.window, of: target.pid) {
             // Closed, or its app quit: its Space goes with it.
             if NSRunningApplication(processIdentifier: target.pid) == nil, let app = target.app { homes[app] = target.home }
@@ -2465,16 +2710,30 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
         }
+        // The keyboard is passed on once the picture is sorted out: asking an app anything can take a while.
+        var handOff: (() -> Void)?
         if !missionControl, Date() >= heldUntil, let current = targets.first(where: { $0.ready && !$0.leaving && $0.standIn.isCurrent }) {
             let showing = stage.isShowing(current.id)
             let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
             let ours = front == getpid()
-            if !swiping, !hidden(current), ours || !showing && front == current.pid, now || Date() >= nextFocus {
+            if !swiping, !hidden(current), ours || !showing && front == current.pid, now && !justFocused(current.window) || Date() >= nextFocus {
                 // Its Space coming up hands the keyboard to this app, or the stage moved off the window
                 // while its app is in front: pass the keyboard on, which brings the window back there too.
                 nextFocus = Date().addingTimeInterval(ours ? 0.5 : 1)
-                note("focus \(current.app ?? "?"): \(ours ? "its Space came up" : "the stage moved off it")")
-                focus(current.window, pid: current.pid)
+                lastFocus = (current.window, Date())
+                handOff = { [self] in
+                    if !ours, let other = targets.first(where: { $0.pid == current.pid && !CFEqual($0.window, current.window) && $0.ready
+                                                                    && !$0.leaving && isFocused($0.window, pid: $0.pid) }) {
+                        // Its app went to another of its windows in true full screen (⌘`, its Window menu):
+                        // that one's Space comes up, as it would in full screen, rather than being pulled back.
+                        note("reveal \(other.app ?? "?"): its app went to another window")
+                        other.standIn.reveal()
+                        revealing = (other.window, Date().addingTimeInterval(1.5))
+                    } else {
+                        note("focus \(current.app ?? "?"): \(ours ? "its Space came up" : "the stage moved off it")")
+                        focus(current.window, pid: current.pid)
+                    }
+                }
             } else if !swiping, !showing, !ours, front != current.pid, Date() >= nextSweep {
                 // Another app opened a window on the stage, where windows open beside the one in front:
                 // it goes to the panel, in front, as it would from the app's own full screen. Never
@@ -2482,7 +2741,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 nextSweep = Date().addingTimeInterval(0.5)
                 soon()
             }
-            if showing { live = current }
+            // Not while the stage moves to its Space, from another window's (one in true full screen
+            // switched to): only once it's there. One already following it keeps on.
+            if showing, current.standIn.isLive || !stageArriving(stage, at: current.id) {
+                switchingSince = nil
+                live = current
+            } else if !showing, stage.hasArrived(at: current.id) {
+                // The window is said to be on screen a moment after the stage gets to its Space.
+                _ = lookAgainSoon()
+            }
         }
         for target in targets {
             if let live, CFEqual(live.window, target.window) {
@@ -2500,6 +2767,41 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let confine = live != nil && !swiping
         if now || confine != stage.isConfined { stage.hold(pointer: confine) }
         stage.fence.armExit(live?.sized == true && NSWorkspace.shared.frontmostApplication?.processIdentifier == live?.pid)
+        guard let handOff else { return }
+        // On screen now, rather than once the app has answered.
+        CATransaction.flush()
+        handOff()
+    }
+
+    /// Whether a window was handed the keyboard a moment ago: several things announce the same
+    /// Space coming up, and it's handed over once.
+    private func justFocused(_ window: AXUIElement) -> Bool {
+        lastFocus.map { CFEqual($0.window, window) && Date().timeIntervalSince($0.at) < 0.3 } ?? false
+    }
+
+    /// Whether the stage is still on its way to a window's Space, in which case it's looked at again
+    /// in a moment. Never for long: after a second it's taken to be there.
+    private func stageArriving(_ stage: Stage, at window: CGWindowID) -> Bool {
+        guard !stage.hasArrived(at: window) else {
+            switchingSince = nil
+            return false
+        }
+        return lookAgainSoon()
+    }
+
+    /// Follows again in a moment, for up to a second of waiting. Returns whether it will.
+    private func lookAgainSoon() -> Bool {
+        let since = switchingSince ?? Date()
+        switchingSince = since
+        guard Date().timeIntervalSince(since) < 1 else { return false }
+        if !followDue {
+            followDue = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(4)) { [self] in
+                followDue = false
+                follow()
+            }
+        }
+        return true
     }
 
     /// A swipe between Spaces moves the panel's, leaving the stage as it is: the picture stays live.
@@ -2529,7 +2831,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Mission Control shows the panel's Spaces, the stand-ins' among them, so let the pointer
     /// go there and keep the stage's own Mission Control out of the picture.
     fileprivate func windowsChanged() {
-        guard !checking, !closing, stage != nil else { return }
+        guard !closing, stage != nil else { return }
+        lookForMissionControl()
+        guard !checking else { return }
         // One look per burst of window changes: each asks WindowServer, which has animations to draw.
         checking = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
@@ -2540,6 +2844,24 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // A window that just opened may have opened on the stage.
             if let stage, entering.isEmpty, !closing, !missionControl { sweep(stage) }
         }
+    }
+
+    /// Mission Control coming up shows on the stage too, so its windows are looked for as they come,
+    /// at most a frame or two apart, rather than once they're all there.
+    private func lookForMissionControl() {
+        guard !missionControl, !closing, stage != nil else { return }
+        let now = DispatchTime.now()
+        if now < nextLook {
+            guard !lookDue else { return }
+            lookDue = true
+            DispatchQueue.main.asyncAfter(deadline: nextLook) { [self] in
+                lookDue = false
+                lookForMissionControl()
+            }
+            return
+        }
+        nextLook = now + .milliseconds(16)
+        if missionControlIsOpen() { missionControlOpened(late: true) }
     }
 
     /// Other apps' windows on the panel (notifications, alerts, the Dock), which can only be over
@@ -2584,12 +2906,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Its windows come and go while it switches between Spaces under a resting pointer: it's over
         // only once they've stayed gone a moment. Anything done before then breaks the switch.
         guard !missionControlIsOpen() else {
-            if missionControlGone != nil { targets.forEach { $0.standIn.showBand(false) } }
+            if missionControlGone != nil {
+                targets.forEach { $0.standIn.showBand(false) }
+                targets.forEach { $0.standIn.hold() }
+                stage?.idle(true)
+            }
             missionControlGone = nil
             return
         }
-        // The top strip is back the moment it's gone, if it went back to a stand-in.
-        if missionControlGone == nil { targets.filter { $0.standIn.isCurrent }.forEach { $0.standIn.showBand(true) } }
+        if missionControlGone == nil {
+            // The top strip is back the moment it's gone, if it went back to a stand-in, and so is the
+            // picture once the stage is back on its window: only the pointer and the keyboard wait.
+            targets.filter { $0.standIn.isCurrent }.forEach { $0.standIn.showBand(true, fading: true) }
+            stage?.idle(false)
+            if let stage, let current = targets.first(where: { $0.ready && !$0.leaving && $0.standIn.isCurrent }),
+               stage.isShowing(current.id), stage.hasArrived(at: current.id) {
+                current.standIn.picture = stage.picture(over: current.standIn.full)
+                current.standIn.goLive()
+            }
+        }
         let gone = missionControlGone ?? Date()
         missionControlGone = gone
         guard Date().timeIntervalSince(gone) >= 0.25 else {

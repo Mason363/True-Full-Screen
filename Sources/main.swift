@@ -364,6 +364,17 @@ private func missionControlIsOpen() -> Bool {
     return windows.contains { ["Spaces Bar", "ExposeShieldWindow"].contains($0[kCGWindowName as String] as? String ?? "") }
 }
 
+/// Where a full screen Space on the panel is while Mission Control zooms it: its backdrop goes along.
+private func fullScreenBackdrop(on panel: CGRect) -> (frame: CGRect, id: CGWindowID)? {
+    let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+    for info in windows where info[kCGWindowName as String] as? String == "Fullscreen Backdrop" {
+        guard let frame = windowBounds(info), let id = info[kCGWindowNumber as String] as? CGWindowID,
+              panel.contains(CGPoint(x: frame.midX, y: frame.midY)) else { continue }
+        return (frame, id)
+    }
+    return nil
+}
+
 private typealias CreateImage = @convention(c) (CGRect, UInt32, CGWindowID, UInt32) -> Unmanaged<CGImage>?
 
 /// The older way to picture a window: gone from the SDK, but a third of the time of
@@ -636,6 +647,11 @@ final class StandIn: NSObject, NSWindowDelegate {
     /// Whether the panel is showing its Space.
     var isCurrent: Bool { isFullScreen && isIn(currentSpace(on: panelID)) }
 
+    /// Whether it's full screen in one of these Spaces.
+    func isIn(anyOf theirs: Set<Int>) -> Bool {
+        isFullScreen && !spaces(of: [CGWindowID(window.windowNumber)]).isDisjoint(with: theirs)
+    }
+
     /// Whether a window of this one's is in a Space.
     private func isIn(_ space: Int?, _ which: NSWindow? = nil) -> Bool {
         guard let space else { return false }
@@ -748,29 +764,10 @@ final class StandIn: NSObject, NSWindowDelegate {
         return above.contains { $0[kCGWindowNumber as String] as? CGWindowID == id }
     }
 
-    /// Hides the band, for Mission Control, which would show it over everything, or shows it again,
-    /// fading in once Mission Control is gone. Left in its Space either way.
-    func showBand(_ on: Bool, fading: Bool = false) {
-        let alpha: CGFloat = on ? 1 : 0
-        guard fading, band.isVisible, band.alphaValue != alpha else {
-            band.alphaValue = alpha
-            return
-        }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            band.animator().alphaValue = alpha
-        }
-    }
-
-    /// Shows the window's own picture instead, in case the last frame caught something else, and
-    /// without the pointer, which is elsewhere by then.
-    func cover(_ image: CGImage) {
-        guard !isLive else { return }
-        still.contents = image
-        still.contentsGravity = .resize
-        still.autoresizingMask = []
-        still.frame = live.frame
-        still.opacity = 1
+    /// Hides the band, for Mission Control, which would show it over everything, or shows it again
+    /// as Mission Control lands back in its Space. Left in its Space either way.
+    func showBand(_ on: Bool) {
+        band.alphaValue = on ? 1 : 0
     }
 
     /// Puts the band over the strip above the window, where displays coming and going don't leave it.
@@ -1966,9 +1963,13 @@ private let accessibilityEvent: AXObserverCallback = { _, element, notification,
     guard let info else { return }
     let controller = Unmanaged<Controller>.fromOpaque(info).takeUnretainedValue()
     let resized = notification as String == kAXResizedNotification
+    let focusMoved = notification as String == kAXFocusedWindowChangedNotification
+    var pid: pid_t = 0
+    if focusMoved { AXUIElementGetPid(element, &pid) }
     MainActor.assumeIsolated {
         // A full screen window resizes as it starts out of full screen: the picture holds still at once.
         if resized { controller.resized(element) }
+        if focusMoved { controller.focusMoved(in: pid) }
         controller.soon()
     }
 }
@@ -2047,6 +2048,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var missionControl = false
     private var swiping = false
     private var checking = false
+    private var checkDue = false
     private var nextLook = DispatchTime(uptimeNanoseconds: 0)
     private var lookDue = false
     private var updateDue = false
@@ -2055,6 +2057,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var missionControlSince = Date.distantPast
     /// When Mission Control's windows were last seen gone, while it's thought up.
     private var missionControlGone: Date?
+    /// Following Mission Control's zoom back into a full screen Space, and when it landed there.
+    private var landing: Task<Void, Never>?
+    private var landed: Date?
     /// A key for Mission Control or Spaces was pressed: the picture holds still until it's clear
     /// what it did.
     private var heldUntil = Date.distantPast
@@ -2700,6 +2705,27 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         update()
     }
 
+    /// An app in front went to one of its windows in true full screen (its Window menu, ⌘`), from a
+    /// desktop or another of its windows there: that window's Space comes up at once, as a full screen
+    /// window's would, rather than once the stage has got there.
+    fileprivate func focusMoved(in pid: pid_t) {
+        // Not while one is on its way in or out, which moves the app's focus about by itself.
+        let elsewhere = { [self] in
+            entering.isEmpty && StandIn.moving == 0 && targets.allSatisfy { !$0.leaving && (!$0.standIn.isCurrent || $0.pid == pid) }
+        }
+        guard !missionControl, !swiping, Date() >= heldUntil, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              elsewhere() else { return }
+        let candidates = targets.filter { $0.pid == pid && $0.ready && !$0.leaving }
+        guard !candidates.isEmpty else { return }
+        Task {
+            guard let target = await focused(among: candidates), !target.standIn.isCurrent, !missionControl, !swiping,
+                  elsewhere() else { return }
+            note("reveal \(target.app ?? "?"): its app went to it")
+            target.standIn.reveal()
+            revealing = (target.window, Date().addingTimeInterval(1.5))
+        }
+    }
+
     /// A target's window resized: out of full screen there, it goes home now rather than in a moment,
     /// before the stage shows much of its way out.
     fileprivate func resized(_ window: AXUIElement) {
@@ -2920,7 +2946,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         checking = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
             checking = false
-            if missionControl { return checkMissionControl() }
+            if missionControl { return }
             refreshOpenings()
             if missionControlIsOpen() { missionControlOpened(late: true) }
             // A window that just opened may have opened on the stage.
@@ -2929,9 +2955,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Mission Control coming up shows on the stage too, so its windows are looked for as they come,
-    /// at most a frame or two apart, rather than once they're all there.
+    /// at most a frame or two apart, rather than once they're all there. And as they go, so the top
+    /// strip is back the moment it's over.
     private func lookForMissionControl() {
-        guard !missionControl, !closing, stage != nil else { return }
+        guard !closing, stage != nil else { return }
         let now = DispatchTime.now()
         if now < nextLook {
             guard !lookDue else { return }
@@ -2943,7 +2970,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         nextLook = now + .milliseconds(16)
-        if missionControlIsOpen() { missionControlOpened(late: true) }
+        if missionControl {
+            checkMissionControl()
+        } else if missionControlIsOpen() {
+            missionControlOpened(late: true)
+        }
     }
 
     /// Other apps' windows on the panel (notifications, alerts, the Dock), which can only be over
@@ -2959,19 +2990,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
     }
 
-    /// Freezes the stand-ins and lets the pointer go to the panel. `late` when Mission Control was
-    /// already up, and the stage's own may have made it into the last frame.
+    /// Freezes the stand-ins and lets the pointer go to the panel. `late` when it's seen by its windows
+    /// rather than a key or a swipe, which is usually still before anything of it shows. A picture of
+    /// the window taken then would be too late: the stage's Mission Control is shrinking it by then.
     private func missionControlOpened(late: Bool) {
         guard !missionControl else { return }
         note("Mission Control\(late ? ", seen late" : "")")
         missionControl = true
         missionControlGone = nil
         missionControlSince = Date()
+        landed = nil
         targets.forEach { $0.standIn.showBand(false) }
-        for target in targets where target.standIn.isLive {
-            target.standIn.hold()
-            if late { Task { if let image = await picture(of: target.id) { target.standIn.cover(image) } } }
-        }
+        targets.forEach { $0.standIn.hold() }
         stage?.hold(pointer: false)
         stage?.idle(true)
 
@@ -2983,23 +3013,40 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func checkMissionControl() {
-        // A swipe up gets here before Mission Control's windows do, and nothing is asked while it opens.
-        guard missionControl, !swiping, Date().timeIntervalSince(missionControlSince) > 0.4 else { return }
+        guard missionControl, !swiping else { return }
+        // A swipe up gets here before Mission Control's windows do, and nothing is asked while it opens:
+        // it's looked at again once that's through, in case it's already over by then.
+        let opening = 0.4 - Date().timeIntervalSince(missionControlSince)
+        guard opening <= 0 else {
+            if !checkDue {
+                checkDue = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + opening) { [self] in
+                    checkDue = false
+                    checkMissionControl()
+                }
+            }
+            return
+        }
         // Its windows come and go while it switches between Spaces under a resting pointer: it's over
         // only once they've stayed gone a moment. Anything done before then breaks the switch.
         guard !missionControlIsOpen() else {
-            if missionControlGone != nil {
+            // Back after going, or still up a while after seeming to land: the strip goes again.
+            if missionControlGone != nil || landed.map({ Date().timeIntervalSince($0) > 0.5 }) == true {
                 targets.forEach { $0.standIn.showBand(false) }
                 targets.forEach { $0.standIn.hold() }
                 stage?.idle(true)
+                landed = nil
             }
             missionControlGone = nil
+            followLanding()
             return
         }
         if missionControlGone == nil {
-            // The top strip is back the moment it's gone, if it went back to a stand-in, and so is the
-            // picture once the stage is back on its window: only the pointer and the keyboard wait.
-            targets.filter { $0.standIn.isCurrent }.forEach { $0.standIn.showBand(true, fading: true) }
+            note("Mission Control gone")
+            // The top strip is back the moment it's gone, if it went back to a stand-in (or already, as
+            // it landed), and so is the picture once the stage is back on its window: only the pointer
+            // and the keyboard wait.
+            targets.filter { $0.standIn.isCurrent }.forEach { $0.standIn.showBand(true) }
             stage?.idle(false)
             if let stage, let current = targets.first(where: { $0.ready && !$0.leaving && $0.standIn.isCurrent }),
                stage.isShowing(current.id), stage.hasArrived(at: current.id) {
@@ -3015,11 +3062,47 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         missionControlGone = nil
         missionControl = false
+        landed = nil
         note("Mission Control over")
         missionControlTimer?.invalidate()
         missionControlTimer = nil
         stage?.idle(false)
         update()
+    }
+
+    /// Mission Control zooming back into a stand-in's Space: its backdrop grows back to the panel's
+    /// size as the zoom lands, a tenth of a second before Mission Control's own windows go. Followed
+    /// frame by frame once it moves, so the top strip is back as the Space lands.
+    private func followLanding() {
+        guard landing == nil, landed == nil, let stage else { return }
+        let panel = stage.panel
+        landing = Task {
+            var last: CGRect?
+            var unmoved = 0
+            // For a second at most, and not while Mission Control just sits there.
+            for _ in 0..<125 where missionControl && missionControlGone == nil && unmoved < 12 {
+                guard let (backdrop, id) = fullScreenBackdrop(on: panel) else { break }
+                if backdrop.width >= panel.width - 1, backdrop.height >= panel.height - 1 {
+                    if last != nil { missionControlLanded(in: spaces(of: [id])) }
+                    break
+                }
+                unmoved = backdrop == last ? unmoved + 1 : 0
+                last = backdrop
+                try? await Task.sleep(for: .milliseconds(8))
+            }
+            landing = nil
+        }
+    }
+
+    /// Its Space only becomes the panel's current one once Mission Control is gone.
+    private func missionControlLanded(in theirs: Set<Int>) {
+        let there = targets.filter { theirs.isEmpty ? $0.standIn.isCurrent : $0.standIn.isIn(anyOf: theirs) }
+        guard missionControl, missionControlGone == nil, !there.isEmpty else { return }
+        note("Mission Control landing")
+        landed = Date()
+        there.forEach { $0.standIn.showBand(true) }
+        // In case its windows stay, Mission Control being up after all.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.52) { self.checkMissionControl() }
     }
 
     // MARK: Menu

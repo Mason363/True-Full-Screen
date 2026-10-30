@@ -256,6 +256,22 @@ private func nearWindowButtons(_ point: CGPoint) -> Bool {
     return false
 }
 
+/// Closes the tiling menu macOS brings up under a green button the pointer rests on, if it's up: the
+/// button's click, taken over here, never reaches it, so it would stay open. Asked of one of its
+/// items, the only part of it that answers.
+private func closeTilingMenu() {
+    let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+    guard let rect = windows.first(where: { $0[kCGWindowOwnerName as String] as? String == "ThemeWidgetControlViewService" }).flatMap(windowBounds)
+    else { return }
+    for fraction in [0.5, 0.25, 0.75] {
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(systemWide, Float(rect.midX), Float(rect.minY + rect.height * fraction), &hit) == .success,
+              let hit, value(hit, kAXRoleAttribute) as? String == kAXMenuItemRole else { continue }
+        AXUIElementPerformAction(hit, kAXCancelAction as CFString)
+        return
+    }
+}
+
 /// A value shared between threads.
 final class Locked<Value>: @unchecked Sendable {
     private let lock = NSLock()
@@ -355,13 +371,15 @@ private typealias CreateImage = @convention(c) (CGRect, UInt32, CGWindowID, UInt
 private let createImage = dlsym(dlopen(nil, RTLD_NOW), "CGWindowListCreateImage").map { unsafeBitCast($0, to: CreateImage.self) }
 
 /// A window on its own, as a picture.
-private func picture(of id: CGWindowID) async -> CGImage? {
+/// `quick` to ask the quick way only, to ask again soon.
+private func picture(of id: CGWindowID, quick: Bool = false) async -> CGImage? {
     guard id != 0 else { return nil }
     // Just this window, without its shadow, at full resolution.
     if let image = createImage?(.null, CGWindowListOption.optionIncludingWindow.rawValue, id,
                                 CGWindowImageOption([.boundsIgnoreFraming, .bestResolution]).rawValue)?.takeRetainedValue() {
         return image
     }
+    guard !quick else { return nil }
     guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
           let window = content.windows.first(where: { $0.windowID == id }) else { return nil }
     let scale = NSScreen.notched?.backingScaleFactor ?? 2
@@ -559,6 +577,8 @@ final class StandIn: NSObject, NSWindowDelegate {
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(button)?.isHidden = true
         }
+        window.titlebarSeparatorStyle = .none
+        hideTitleBar()
         window.collectionBehavior = [.fullScreenPrimary]
         window.animationBehavior = .none
         window.isReleasedWhenClosed = false
@@ -641,6 +661,10 @@ final class StandIn: NSObject, NSWindowDelegate {
         while transition != nil { try? await Task.sleep(for: .milliseconds(20)) }
         return await withCheckedContinuation { done in
             start(done)
+            // In front first, so it stays in sight all the way home as the Spaces change behind it, as a
+            // window leaving full screen does: the front app's windows are the ones lifted over the change.
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
             window.toggleFullScreen(nil)
         }
     }
@@ -676,13 +700,16 @@ final class StandIn: NSObject, NSWindowDelegate {
     }
 
     /// Fades in the window's own picture, as it is out of full screen, for the end of the way out.
-    /// Once it's in, nothing else shows around its rounded corners.
-    func land(_ image: CGImage) {
+    /// Once it's in, nothing else shows around its rounded corners. Returns how long that takes: the
+    /// window waits to take its place until then, and its picture can only be had near the end.
+    @discardableResult
+    func land(_ image: CGImage) -> TimeInterval {
+        let duration = 0.12
         still.contents = image
         still.contentsGravity = .resize
         still.backgroundColor = nil
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.2)
+        CATransaction.setAnimationDuration(duration)
         CATransaction.setCompletionBlock { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.still.opacity == 1, !self.isLive else { return }
@@ -696,6 +723,7 @@ final class StandIn: NSObject, NSWindowDelegate {
         fade.toValue = 1
         still.add(fade, forKey: "opacity")
         CATransaction.commit()
+        return duration
     }
 
     /// Clears the window around its picture, or makes it solid black, as it is in full screen.
@@ -840,9 +868,16 @@ final class StandIn: NSObject, NSWindowDelegate {
     private(set) var enterDuration: TimeInterval = 0
 
     func windowDidEnterFullScreen(_ notification: Notification) {
+        hideTitleBar()
         showBehind(false)
         layout()
         finish(true)
+    }
+
+    /// The title bar a window needs to go full screen, kept out of sight: in full screen it would come
+    /// down with the menu bar whenever the pointer reached the top of the panel, empty.
+    private func hideTitleBar() {
+        window.standardWindowButton(.closeButton)?.superview?.superview?.alphaValue = 0
     }
 
     func windowDidFailToEnterFullScreen(_ window: NSWindow) { finish(false) }
@@ -883,6 +918,9 @@ final class StandIn: NSObject, NSWindowDelegate {
 
     func windowDidExitFullScreen(_ notification: Notification) {
         shrinking = nil
+        // Back among the desktop's windows, in front of them, where the window it stands in for comes
+        // back: its app's other windows would otherwise cover it until that one does.
+        window.orderFrontRegardless()
         finish(true)
     }
 
@@ -2077,9 +2115,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
         clicks.onTakeOver = { [weak self] window, pid, sized in
+            Self.closeTilingMenuSoon()
             MainActor.assumeIsolated { _ = Task { await self?.takeOver(window, pid: pid, sized: sized) } }
         }
-        clicks.onLeave = { [weak self] window in MainActor.assumeIsolated { self?.leave(window, "green button") } }
+        clicks.onLeave = { [weak self] window in
+            Self.closeTilingMenuSoon()
+            MainActor.assumeIsolated { self?.leave(window, "green button") }
+        }
         StandIn.onStill = { [weak self] in
             MainActor.assumeIsolated {
                 if self?.updateDue == true { self?.update() }
@@ -2118,6 +2160,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for event in windowEvents {
                 _ = register(connection, windowServerEvent, event, Unmanaged.passUnretained(self).toOpaque())
             }
+        }
+    }
+
+    /// Closes macOS's tiling menu, now and as it may still come up for a moment after the click.
+    private nonisolated static func closeTilingMenuSoon() {
+        for delay in [0.0, 0.5, 1.0] {
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { closeTilingMenu() }
         }
     }
 
@@ -2404,17 +2453,28 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let elapsed = { "\(Int(started.duration(to: .now) / .milliseconds(1))) ms" }
         target.standIn.hold()
         stage?.hold(pointer: false)
-        // Called back while still full screen there (quitting, switched off, on its way in): out first.
-        if !target.sized { await outOfFullScreen(target.window) }
+        // The stand-in starts home at once; a window still full screen there (quitting, switched off,
+        // on its way in) is taken out meanwhile, its app being too busy to answer quickly then.
         async let left = target.standIn.leave(to: target.home)
-        if target.sized { await apart { setSize(target.window, target.home.size) } }
+        if target.sized { await apart { setSize(target.window, target.home.size) } } else { await outOfFullScreen(target.window) }
         for _ in 0..<30 {
             if let size = await apart({ frame(of: target.window)?.size }), abs(size.width - target.home.width) < 2,
                abs(size.height - target.home.height) < 2 { break }
             try? await Task.sleep(for: .milliseconds(30))
         }
         note("home: sized back after \(elapsed())")
-        if let image = await picture(of: target.id) { target.standIn.land(image) }
+        // Its own picture, as it is out of full screen, for the end of the way out. The window can be
+        // pictured only once its own way out on the stage is over, about when the stand-in's is, so
+        // it's asked again until it can, and takes the stand-in's place only once that's faded in.
+        var landed: ContinuousClock.Instant?
+        for _ in 0..<60 {
+            if let image = await picture(of: target.id, quick: true) {
+                landed = .now + .milliseconds(Int(target.standIn.land(image) * 1000))
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+        note("home: \(landed == nil ? "no picture of the window" : "pictured") after \(elapsed())")
         _ = await left
         note("home: stand-in out after \(elapsed())")
         // An app too busy to answer before may have gone full screen there since.
@@ -2429,6 +2489,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? await Task.sleep(for: .milliseconds(300))
             AXUIElementSetAttributeValue(target.window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
+        if let landed { try? await Task.sleep(until: landed, clock: .continuous) }
         focus(target.window, pid: target.pid)
         // The stand-in goes once the window is in front of it, so nothing behind shows in between.
         for _ in 0..<40 where !target.standIn.isCovered(by: target.id) {
@@ -2625,13 +2686,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func activated(_ notification: Notification) {
         // Switched to from elsewhere (⌘Tab, the Dock): its Space comes up, as any full screen app's does.
-        if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-           !missionControl, !swiping,
-           let target = targets.first(where: { $0.pid == app.processIdentifier && $0.ready && !$0.leaving && isFocused($0.window, pid: $0.pid) }),
-           !target.standIn.isCurrent {
-            target.standIn.reveal()
-            // Its Space takes a moment to come up, meanwhile the one before is still current.
-            revealing = (target.window, Date().addingTimeInterval(1.5))
+        if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, !missionControl, !swiping {
+            let candidates = targets.filter { $0.pid == app.processIdentifier && $0.ready && !$0.leaving }
+            if !candidates.isEmpty {
+                Task {
+                    guard let target = await focused(among: candidates), !target.standIn.isCurrent, !missionControl, !swiping else { return }
+                    target.standIn.reveal()
+                    // Its Space takes a moment to come up, meanwhile the one before is still current.
+                    revealing = (target.window, Date().addingTimeInterval(1.5))
+                }
+            }
         }
         update()
     }
@@ -2639,9 +2703,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// A target's window resized: out of full screen there, it goes home now rather than in a moment,
     /// before the stage shows much of its way out.
     fileprivate func resized(_ window: AXUIElement) {
-        guard let target = targets.first(where: { CFEqual($0.window, window) }), target.ready, !target.sized, !target.leaving,
-              fullScreen(window) == false else { return }
-        leave(window, "out of full screen")
+        guard let target = targets.first(where: { CFEqual($0.window, window) }), target.ready, !target.sized, !target.leaving else { return }
+        Task {
+            // Asked off the main thread: its app may be busy with another of its windows, and waiting on
+            // it would stall a stand-in on its way in or out.
+            guard await apart({ fullScreen(window) }) == false else { return }
+            leave(window, "out of full screen")
+        }
+    }
+
+    /// Which of these windows has the keyboard in its app, asked off the main thread.
+    private func focused(among candidates: [Target]) async -> Target? {
+        let windows = candidates.map { ($0.window, $0.pid) }
+        guard let index = await apart({ windows.firstIndex { isFocused($0.0, pid: $0.1) } }) else { return nil }
+        let window = candidates[index].window
+        return targets.first { CFEqual($0.window, window) && $0.ready && !$0.leaving }
     }
 
     /// One update for a burst of changes.
@@ -2721,17 +2797,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // while its app is in front: pass the keyboard on, which brings the window back there too.
                 nextFocus = Date().addingTimeInterval(ours ? 0.5 : 1)
                 lastFocus = (current.window, Date())
+                let others = ours ? [] : targets.filter { $0.pid == current.pid && !CFEqual($0.window, current.window) && $0.ready && !$0.leaving }
                 handOff = { [self] in
-                    if !ours, let other = targets.first(where: { $0.pid == current.pid && !CFEqual($0.window, current.window) && $0.ready
-                                                                    && !$0.leaving && isFocused($0.window, pid: $0.pid) }) {
-                        // Its app went to another of its windows in true full screen (⌘`, its Window menu):
-                        // that one's Space comes up, as it would in full screen, rather than being pulled back.
-                        note("reveal \(other.app ?? "?"): its app went to another window")
-                        other.standIn.reveal()
-                        revealing = (other.window, Date().addingTimeInterval(1.5))
-                    } else {
+                    guard !others.isEmpty else {
                         note("focus \(current.app ?? "?"): \(ours ? "its Space came up" : "the stage moved off it")")
-                        focus(current.window, pid: current.pid)
+                        return focus(current.window, pid: current.pid)
+                    }
+                    Task {
+                        if let other = await focused(among: others), !other.standIn.isCurrent {
+                            // Its app went to another of its windows in true full screen (⌘`, its Window menu):
+                            // that one's Space comes up, as it would in full screen, rather than being pulled back.
+                            note("reveal \(other.app ?? "?"): its app went to another window")
+                            other.standIn.reveal()
+                            revealing = (other.window, Date().addingTimeInterval(1.5))
+                        } else {
+                            note("focus \(current.app ?? "?"): the stage moved off it")
+                            focus(current.window, pid: current.pid)
+                        }
                     }
                 }
             } else if !swiping, !showing, !ours, front != current.pid, Date() >= nextSweep {

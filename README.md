@@ -15,7 +15,7 @@ Press the green button as usual. The menu bar and traffic lights still slide in 
 
 ![Safari in true full screen](docs/wikipedia.png)
 
-Apps with no full screen of their own, like Photoshop, fill the screen too. ⌃⌘F, or the green button in the title bar that slides in, brings them back.
+Apps with no full screen of their own, like Photoshop, fill the screen too. ⌃⌘F, or the green button in the title bar that slides in, brings them back. Windows that can't be resized, like System Settings, keep their usual zoom.
 
 ![Photoshop in true full screen](docs/photoshop.png)
 
@@ -23,6 +23,8 @@ Apps with no full screen of their own, like Photoshop, fill the screen too. ⌃�
 
 - **True Full Screen** turns it on or off.
 - **Apps** lists open apps. Uncheck one to give it normal full screen.
+- **Always in True Full Screen** lists open apps. Check one to have its windows go into true full screen as they open.
+- **Keep Ready** keeps the virtual display around, so windows go in about twice as fast.
 
 ## How
 

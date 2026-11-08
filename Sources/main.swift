@@ -261,6 +261,51 @@ private func distance(_ point: CGPoint, to rect: CGRect) -> CGFloat {
     return hypot(point.x - near.x, point.y - near.y)
 }
 
+/// How far two rects run alongside each other, across and down: below zero apart, zero touching.
+private func overlap(_ a: CGRect, _ b: CGRect) -> (across: CGFloat, down: CGFloat) {
+    (min(a.maxX, b.maxX) - max(a.minX, b.minX), min(a.maxY, b.maxY) - max(a.minY, b.minY))
+}
+
+/// Whether a display there meets these others at a corner at most, so that every edge of it is one
+/// the pointer stops at: its top edge above all, where the menu bar and a full screen window's title
+/// bar come in. Along another display, the pointer goes on over instead, and they never do.
+private func isClear(_ rect: CGRect, of displays: [CGRect]) -> Bool {
+    displays.allSatisfy {
+        let (across, down) = overlap(rect, $0)
+        return across < 0 || down < 0 || across == 0 && down == 0
+    }
+}
+
+/// Where a display of this size meets one of these at a corner and is clear of the rest: off the
+/// bottom right of them all, as ever, if that's such a spot, otherwise off a corner of the panel,
+/// then of the others. Displays above or beside the panel can leave the first touching none of them,
+/// and macOS would put the display somewhere along one instead.
+private func clearSpot(for size: CGSize, panel: CGRect, among displays: [CGRect]) -> CGPoint? {
+    let all = displays.reduce(CGRect.null) { $0.union($1) }
+    let corners = { (rect: CGRect) in
+        [CGPoint(x: rect.maxX, y: rect.maxY), CGPoint(x: rect.minX - size.width, y: rect.maxY),
+         CGPoint(x: rect.maxX, y: rect.minY - size.height), CGPoint(x: rect.minX - size.width, y: rect.minY - size.height)]
+    }
+    return ([CGPoint(x: all.maxX, y: all.maxY)] + corners(panel) + displays.flatMap(corners)).first { spot in
+        let rect = CGRect(origin: spot, size: size)
+        return isClear(rect, of: displays) && displays.contains { overlap(rect, $0) == (0, 0) }
+    }
+}
+
+/// Moves a stage display to a clear spot, unless it's in one already. Returns whether it asked for a
+/// move, which macOS makes a moment later.
+private func placeClear(_ id: CGDirectDisplayID, panel: CGRect) -> Bool {
+    let others = activeDisplays().filter { $0 != id }.map(CGDisplayBounds)
+    let now = CGDisplayBounds(id)
+    guard !isClear(now, of: others) || !others.contains(where: { overlap(now, $0) == (0, 0) }),
+          let spot = clearSpot(for: now.size, panel: panel, among: others) else { return false }
+    var config: CGDisplayConfigRef?
+    CGBeginDisplayConfiguration(&config)
+    CGConfigureDisplayOrigin(config, id, Int32(spot.x), Int32(spot.y))
+    CGCompleteDisplayConfiguration(config, .forSession)
+    return true
+}
+
 private func windowBounds(_ info: [String: Any]) -> CGRect? {
     (info[kCGWindowBounds as String] as! CFDictionary?).flatMap(CGRect.init(dictionaryRepresentation:))
 }
@@ -469,6 +514,8 @@ private func runLoopThread(_ name: String) -> CFRunLoop {
 
 private let clickLoop = runLoopThread("TrueFullScreen.clicks")
 private let pointerLoop = runLoopThread("TrueFullScreen.pointer")
+/// For listening only: nothing waits on it.
+private let inputLoop = runLoopThread("TrueFullScreen.input")
 
 private func add(_ taps: [CFMachPort], to loop: CFRunLoop) {
     for tap in taps { CFRunLoopAddSource(loop, CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes) }
@@ -1220,6 +1267,8 @@ private let gestureMotion = CGEventField(rawValue: 123)!
 private let dockSwipe: Int64 = 23
 private let vertical: Int64 = 2
 private let titleBarHeight: CGFloat = 28
+/// How far down the panel's menu bar reaches, with room to spare: 32 pt in full screen, 33 on the desktop.
+private let menuBarReach: CGFloat = 44
 /// Keys for Mission Control, App Exposé and moving between Spaces: its own key, and ⌃ with an
 /// arrow or a number.
 private let missionControlKey: Int64 = 160
@@ -1264,11 +1313,12 @@ protocol FenceDelegate: AnyObject {
 /// pointer thread, and the main thread tells it what to hold to.
 final class Fence: @unchecked Sendable {
     let panel: CGRect
-    let bounds: CGRect
     let sprite: Sprite
     /// The main thread's.
     weak var delegate: FenceDelegate?
-    private let others: [CGRect]
+    /// The stage, and the other displays, where they are now.
+    private var bounds: CGRect
+    private var others: [CGRect]
     private let shortcuts = spaceShortcuts()
     private let lock = NSLock()
     private var taps: [CFMachPort] = []
@@ -1342,6 +1392,9 @@ final class Fence: @unchecked Sendable {
     func setTop(_ value: CGFloat) { locked { top = value; offset = value } }
 
     func setOpenings(_ rects: [CGRect]) { locked { openings = rects } }
+
+    /// Displays came, went or moved, the stage among them.
+    func place(bounds: CGRect, others: [CGRect]) { locked { self.bounds = bounds; self.others = others } }
 
     /// Arms ⌃⌘F, while a window sized to fill is in front.
     func armExit(_ on: Bool) { locked { exitArmed = on } }
@@ -1559,7 +1612,8 @@ private let fenceCallback: CGEventTapCallBack = { _, type, event, info in
 /// A notch-free virtual display the size of the built-in one, and its live picture.
 @MainActor
 final class Stage: NSObject, SCStreamOutput, FenceDelegate {
-    let bounds: CGRect
+    /// Where the display is: macOS can move it as other displays come and go.
+    private(set) var bounds: CGRect
     let panel: CGRect
     let panelID: CGDirectDisplayID
     let id: CGDirectDisplayID
@@ -1625,15 +1679,9 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
         }
         guard CGDisplayIsActive(id) != 0 else { return nil }
 
-        // Touch the other displays only at a corner, so the pointer stays on whichever side it's put.
-        // macOS remembers the spot, so after the first time it's already there.
-        let others = activeDisplays().filter { $0 != id }.reduce(CGRect.null) { $0.union(CGDisplayBounds($1)) }
-        if CGDisplayBounds(id).origin != CGPoint(x: others.maxX, y: others.maxY) {
-            var config: CGDisplayConfigRef?
-            CGBeginDisplayConfiguration(&config)
-            CGConfigureDisplayOrigin(config, id, Int32(others.maxX), Int32(others.maxY))
-            CGCompleteDisplayConfiguration(config, .forSession)
-        }
+        // Touch the other displays only at a corner, so the pointer stays on whichever side it's put,
+        // and stops at the top edge. macOS remembers the spot, so after the first time it's already there.
+        _ = placeClear(id, panel: CGDisplayBounds(screen.displayID))
         // In place once it has a Space of its own: a stand-in can start growing then, the display no
         // longer moving anything about. Apps learn of it a while later.
         for _ in 0..<500 where currentSpace(on: id) == nil {
@@ -1656,7 +1704,9 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
         self.panel = CGDisplayBounds(panel)
         id = display.displayID
         bounds = CGDisplayBounds(display.displayID)
-        fence = Fence(panel: self.panel, bounds: bounds, others: activeDisplays().filter { $0 != display.displayID }.map(CGDisplayBounds))
+        UserDefaults.standard.set([bounds.minX, bounds.minY], forKey: "spot")
+        placedAmong = activeDisplays().filter { $0 != display.displayID }.map(CGDisplayBounds)
+        fence = Fence(panel: self.panel, bounds: bounds, others: placedAmong)
         feed = Feed(panel: NSScreen.screens.first { $0.displayID == panel }?.colorSpace?.cgColorSpace)
         super.init()
         fence.delegate = self
@@ -1673,6 +1723,30 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
 
     /// When this app learned of the display.
     private var known: Task<ContinuousClock.Instant, Never>?
+    /// The other displays, as they were when the display was last put clear of them.
+    private var placedAmong: [CGRect]
+
+    /// Displays came, went or moved. One now along an edge of the stage takes that edge from it, the
+    /// top edge where the menu bar comes in among them: the stage moves clear of it again. Then, wherever
+    /// macOS has it, the pointer is held to it there.
+    func displaysChanged() {
+        guard display != nil else { return }
+        let others = activeDisplays().filter { $0 != id }.map(CGDisplayBounds)
+        // Once for each arrangement: the move brings another change, and macOS may have its own idea.
+        if others != placedAmong {
+            placedAmong = others
+            if placeClear(id, panel: panel) { return note("virtual display \(id) moves clear of the other displays") }
+        }
+        let now = CGDisplayBounds(id)
+        guard !now.isEmpty else { return }
+        if now != bounds {
+            note("virtual display \(id) now at \(now)\(isClear(now, of: others) ? "" : ", along another display")")
+            bounds = now
+            UserDefaults.standard.set([bounds.minX, bounds.minY], forKey: "spot")
+        }
+        fence.place(bounds: now, others: others)
+        if fence.isConfined { fence.hold(true) }
+    }
 
     /// Starts the live picture, unless it's running already.
     func startCapture() {
@@ -1877,6 +1951,19 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
 
 // MARK: - Clicks
 
+/// A click or key press, as far as telling what put a window in full screen goes.
+struct Input {
+    enum Kind {
+        /// With ⌘, or 🌐F: a menu's key, the window's own way into full screen among them.
+        case key(command: Bool)
+        /// On a window of this app (0 if none was found), at this level. `secondary` for a right click
+        /// or a Control-click, which brings up a contextual menu.
+        case click(pid: pid_t, layer: Int, secondary: Bool)
+    }
+    let time: CFAbsoluteTime
+    let kind: Kind
+}
+
 /// Watches for green-button clicks on the panel, on a thread of its own: every click on the Mac
 /// waits for the answer, so it must never wait on anything else.
 final class Clicks: @unchecked Sendable {
@@ -1891,10 +1978,13 @@ final class Clicks: @unchecked Sendable {
     }
 
     let state = Locked(State())
+    /// The last few clicks and key presses, the latest last.
+    let inputs = Locked<[Input]>([])
     /// Called on the main thread: a window to take over, its app, and whether it's sized to fill.
     var onTakeOver: ((AXUIElement, pid_t, Bool) -> Void)?
     var onLeave: ((AXUIElement) -> Void)?
     private var tap: CFMachPort?
+    private var listener: CFMachPort?
     /// The click thread's.
     private var swallowMouseUp = false
 
@@ -1905,6 +1995,36 @@ final class Clicks: @unchecked Sendable {
                                 eventsOfInterest: clicks.reduce(0) { $0 | 1 << $1.rawValue },
                                 callback: clickCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
         if let tap { add([tap], to: clickLoop) }
+        let heard: [CGEventType] = [.leftMouseDown, .rightMouseDown, .keyDown]
+        listener = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                     eventsOfInterest: heard.reduce(0) { $0 | 1 << $1.rawValue },
+                                     callback: inputCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
+        if let listener { add([listener], to: inputLoop) }
+    }
+
+    /// Notes a click or key press, and for a click, the window it went to, while it's still up: a
+    /// menu goes as soon as an item in it is chosen.
+    fileprivate func heard(_ type: CGEventType, _ event: CGEvent) {
+        let kind: Input.Kind
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            if let listener { CGEvent.tapEnable(tap: listener, enable: true) }
+            return
+        case .keyDown:
+            let flags = event.flags
+            kind = .key(command: flags.contains(.maskCommand)
+                        || flags.contains(.maskSecondaryFn) && event.getIntegerValueField(.keyboardEventKeycode) == 3)
+        case .leftMouseDown, .rightMouseDown:
+            let handling = event.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent)
+            let under = handling != 0 ? handling : event.getIntegerValueField(.mouseEventWindowUnderMousePointer)
+            let info = under == 0 ? nil : (CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(truncatingIfNeeded: under)) as? [[String: Any]])?.first
+            kind = .click(pid: info?[kCGWindowOwnerPID as String] as? pid_t ?? 0, layer: info?[kCGWindowLayer as String] as? Int ?? -1,
+                          secondary: type == .rightMouseDown || event.flags.contains(.maskControl))
+        default:
+            return
+        }
+        let input = Input(time: CFAbsoluteTimeGetCurrent(), kind: kind)
+        inputs { $0 = Array(($0 + [input]).suffix(4)) }
     }
 
     /// Takes over green-button clicks on the notched display. Returns true to swallow the event.
@@ -1969,6 +2089,11 @@ final class Clicks: @unchecked Sendable {
 private let clickCallback: CGEventTapCallBack = { _, type, event, info in
     let clicks = Unmanaged<Clicks>.fromOpaque(info!).takeUnretainedValue()
     return clicks.handle(type, event) ? nil : Unmanaged.passUnretained(event)
+}
+
+private let inputCallback: CGEventTapCallBack = { _, type, event, info in
+    Unmanaged<Clicks>.fromOpaque(info!).takeUnretainedValue().heard(type, event)
+    return Unmanaged.passUnretained(event)
 }
 
 /// WindowServer events for windows appearing and disappearing, Mission Control's among them.
@@ -2056,6 +2181,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var targets: [Target] = [] { didSet { publish() } }
     private var entering: [AXUIElement] = []
     private var ignored: [AXUIElement] = [] { didSet { publish() } }
+    /// Windows in a full screen their page or app asked for, left in it until they come out of it.
+    private var leftAlone: [(window: AXUIElement, pid: pid_t)] = []
     private var stage: Stage?
     private var opening = false { didSet { if !opening { stageSettled() } } }
     private var closing = false { didSet { if !closing { stageSettled() } } }
@@ -2240,12 +2367,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rescueWindows() {
         guard AXIsProcessTrusted(), let screen = NSScreen.notched else { return }
         let panel = CGDisplayBounds(screen.displayID)
-        let all = NSScreen.screens.reduce(CGRect.null) { $0.union(CGDisplayBounds($1.displayID)) }
-        let lost = CGRect(x: all.maxX, y: all.maxY, width: panel.width, height: panel.height)
+        let displays = NSScreen.screens.map { CGDisplayBounds($0.displayID) }
+        let all = displays.reduce(CGRect.null) { $0.union($1) }
+        let spot = (defaults.array(forKey: "spot") as? [Double]).flatMap { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
+        let lost = CGRect(origin: spot ?? CGPoint(x: all.maxX, y: all.maxY), size: panel.size)
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
             for window in windows(of: app.processIdentifier) {
-                guard isStandardWindow(window),
-                      let rect = frame(of: window), lost.contains(rect.origin), !rect.intersects(all) else { continue }
+                guard isStandardWindow(window), let rect = frame(of: window), lost.contains(rect.origin),
+                      !displays.contains(where: { rect.intersects($0) }) else { continue }
                 move(window, to: rect.origin - lost.origin + panel.origin)
             }
         }
@@ -2287,9 +2416,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         publish()
         targets.forEach { $0.standIn.pin() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.getReady() }
+        guard let stage else { return }
         // The panel went away (lid closed). With nothing left to show the stage on, macOS would move
         // every window and Space onto it, so take it down at once.
-        guard let stage, CGDisplayIsOnline(stage.panelID) == 0 || CGDisplayBounds(stage.panelID) != stage.panel else { return }
+        guard CGDisplayIsOnline(stage.panelID) == 0 || CGDisplayBounds(stage.panelID) != stage.panel else {
+            // Another display came, went or moved: the stage keeps clear of it. Not from inside the
+            // change being announced.
+            DispatchQueue.main.async { stage.displaysChanged() }
+            return
+        }
         for target in targets {
             if target.sized { setSize(target.window, target.home.size) } else { setFullScreen(target.window, false) }
             drop(target, "panel gone")
@@ -2309,7 +2444,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Windows already handled, on their way, or left alone because they couldn't be moved.
     private func isBusy(_ window: AXUIElement) -> Bool {
-        [targets.map(\.window), entering, ignored].contains { $0.contains { CFEqual($0, window) } }
+        [targets.map(\.window), entering, ignored, leftAlone.map(\.window)].contains { $0.contains { CFEqual($0, window) } }
     }
 
     /// Moves a window to the stage and takes it full screen there, while its stand-in grows out of
@@ -2493,18 +2628,51 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Windows that went full screen another way (keyboard, menu, relaunch) are moved over too,
-    /// once their own animation is done.
+    /// once their own animation is done. Not ones whose page or app put them there.
     private func adoptFullScreenWindow() {
+        // Out of the full screen its page asked for: from now on it goes the way any other window does.
+        leftAlone.removeAll { fullScreen($0.window) == false || isGone($0.window, of: $0.pid) }
         guard enabled, allowed, let screen = NSScreen.notched, let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != getpid(), let id = app.bundleIdentifier, !excluded.contains(id),
               let window = element(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute),
               !isBusy(window), isFullScreen(window), let origin = frame(of: window)?.origin, CGDisplayBounds(screen.displayID).contains(origin)
         else { return }
+        if let why = askedFromInside(app.processIdentifier) {
+            note("leave \(id) in its own full screen: \(why)")
+            leftAlone.append((window, app.processIdentifier))
+            return
+        }
         entering.append(window)
         Task {
             try? await Task.sleep(for: .milliseconds(700))
             entering.removeAll { CFEqual($0, window) }
             await takeOver(window, pid: app.processIdentifier, sized: false)
+        }
+    }
+
+    /// What put a window of this app in full screen just now, if the window itself asked: a video's
+    /// full screen button, its F key, a game's own key. Taken out of that full screen to go into true
+    /// full screen, the window would end the video's with it, and go into true full screen without
+    /// it. Otherwise, nil: the window's own way there, which is its menu item, ⌃⌘F or 🌐F, or the
+    /// app opening it in full screen.
+    private func askedFromInside(_ pid: pid_t) -> String? {
+        let now = CFAbsoluteTimeGetCurrent()
+        let recent = clicks.inputs { $0 }.filter { now - $0.time < 3 }
+        guard let last = recent.last else { return nil }
+        let inside = { (input: Input) -> Bool in
+            if case .click(pid, 0, _) = input.kind { return true }
+            return false
+        }
+        switch last.kind {
+        case .key(let command):
+            return command ? nil : "a key pressed in it"
+        case .click:
+            if inside(last) { return "a click in it" }
+            // An item of a menu: the window's own contextual menu (a video's Full Screen), or its app's.
+            if recent.count > 1, case .click(_, _, true) = recent[recent.count - 2].kind, inside(recent[recent.count - 2]) {
+                return "its contextual menu"
+            }
+            return nil
         }
     }
 
@@ -3079,12 +3247,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// the stand-ins, there being nothing else in their Spaces.
     private func refreshOpenings() {
         guard let stage else { return }
+        let panel = stage.panel
         let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
         stage.fence.setOpenings(windows.compactMap { info in
             guard info[kCGWindowOwnerPID as String] as? pid_t != getpid(), info[kCGWindowOwnerName as String] as? String != "Window Server",
                   (info[kCGWindowLayer as String] as? Int ?? -1) >= 0, (info[kCGWindowAlpha as String] as? Double ?? 0) > 0,
-                  let rect = windowBounds(info), rect.intersects(stage.panel) else { return nil }
-            return rect.intersection(stage.panel)
+                  let rect = windowBounds(info), rect.intersects(panel) else { return nil }
+            // Up in the menu bar: the band is over it, and the pointer there belongs at the stage's top
+            // edge, where its own menu bar and title bar come in. Since macOS 27.2 something other than
+            // the window server puts a window there, and the pointer was sent to it instead.
+            guard rect.maxY > panel.minY + menuBarReach else { return nil }
+            return rect.intersection(panel)
         })
     }
 

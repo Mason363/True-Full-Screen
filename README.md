@@ -35,6 +35,7 @@ The window moves to a notch-free virtual display the size of your screen and goe
 - Needs Accessibility and Screen Recording.
 - macOS shows its screen-recording dot while an app is in true full screen.
 - Mission Control labels the Space True Full Screen.
+- A video's own full screen button, like YouTube's, gives normal full screen.
 - Idle: 0% CPU, under 30 MB.
 - Uses private macOS APIs. Tested on macOS 27.
 

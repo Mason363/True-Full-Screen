@@ -11,7 +11,7 @@
 
 ![True full screen on a MacBook](docs/yosemite.png)
 
-Press the green button as usual. The menu bar and traffic lights still slide in at the top, and Mission Control, swipes and ⌘Tab work as with any full screen app.
+Press the green button as usual, or ⌃⌘F. The menu bar and traffic lights still slide in at the top, and Mission Control, swipes and ⌘Tab work as with any full screen app.
 
 ![Safari in true full screen](docs/wikipedia.png)
 
@@ -24,6 +24,7 @@ Apps with no full screen of their own, like Photoshop, fill the screen too. ⌃�
 - **True Full Screen** turns it on or off.
 - **Apps** lists open apps. Uncheck one to give it normal full screen.
 - **Always in True Full Screen** lists open apps. Check one to have its windows go into true full screen as they open.
+- **In Games** lets games go into true full screen too. Otherwise they keep their own.
 - **Keep Ready** keeps the virtual display around, so windows go in about twice as fast.
 
 ## How
@@ -35,7 +36,8 @@ The window moves to a notch-free virtual display the size of your screen and goe
 - Needs Accessibility and Screen Recording.
 - macOS shows its screen-recording dot while an app is in true full screen.
 - Mission Control labels the Space True Full Screen.
-- A video's own full screen button, like YouTube's, gives normal full screen.
+- A video's own full screen, from its button or its key, stays as it is: normal full screen, the video filling it.
+- A game is an app that says it's one, by its category.
 - Idle: 0% CPU, under 30 MB.
 - Uses private macOS APIs. Tested on macOS 27.
 

@@ -63,6 +63,12 @@ private func fullScreen(_ window: AXUIElement) -> Bool? {
 
 private func isFullScreen(_ window: AXUIElement) -> Bool { fullScreen(window) == true }
 
+/// Whether a window says it's out of full screen, as against not saying either way.
+private func isOutOfFullScreen(_ window: AXUIElement) -> Bool {
+    var value: CFTypeRef?
+    return AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &value) == .success && value as? Bool == false
+}
+
 private func setFullScreen(_ window: AXUIElement, _ on: Bool) {
     AXUIElementSetAttributeValue(window, "AXFullScreen" as CFString, (on ? kCFBooleanTrue : kCFBooleanFalse)!)
 }
@@ -163,11 +169,14 @@ private func isFocused(_ window: AXUIElement, pid: pid_t) -> Bool {
 }
 
 /// Moves a window and makes sure it stays there, since a window still animating can snap back.
-private func place(_ window: AXUIElement, at point: CGPoint) async {
+/// `still` for one that's at rest, which is there as soon as it says so.
+private func place(_ window: AXUIElement, at point: CGPoint, still: Bool = false) async {
     for _ in 0..<25 {
         move(window, to: point)
-        try? await Task.sleep(for: .milliseconds(40))
-        if let origin = frame(of: window)?.origin, abs(origin.x - point.x) < 2, abs(origin.y - point.y) < 2 { return }
+        for _ in 0..<(still ? 5 : 1) {
+            try? await Task.sleep(for: .milliseconds(still ? 8 : 40))
+            if let origin = frame(of: window)?.origin, abs(origin.x - point.x) < 2, abs(origin.y - point.y) < 2 { return }
+        }
     }
 }
 
@@ -386,6 +395,16 @@ private func spaces(on display: CGDirectDisplayID) -> Set<Int> {
     return Set((match["Spaces"] as? [[String: Any]] ?? []).compactMap { $0["ManagedSpaceID"] as? Int })
 }
 
+/// The full screen Spaces of a display, each window in full screen there having one of its own.
+private func fullScreenSpaces(on display: CGDirectDisplayID) -> Set<Int> {
+    guard let displays = copyManagedDisplaySpaces?(connection)?.takeRetainedValue() as? [[String: Any]] else { return [] }
+    let id = identifier(of: display)
+    // One for all of them, when displays don't have Spaces of their own.
+    guard let match = displays.first(where: { $0["Display Identifier"] as? String == id }) ?? (displays.count == 1 ? displays.first : nil)
+    else { return [] }
+    return Set((match["Spaces"] as? [[String: Any]] ?? []).compactMap { $0["type"] as? Int == 4 ? $0["ManagedSpaceID"] as? Int : nil })
+}
+
 /// The Space a display is showing, as the window server has it, which is right even partway
 /// through a switch, as asking a window whether it's on the active Space isn't. Asked directly,
 /// a few microseconds each time, so it's never a moment out of date.
@@ -490,6 +509,24 @@ private func trimmed(_ image: CGImage, to size: CGSize, scale: CGFloat) -> CGIma
     return image.cropping(to: CGRect(x: x, y: y, width: width, height: height)) ?? image
 }
 
+// MARK: - Games
+
+private let gameVerdicts = Locked<[URL: Bool]>([:])
+
+/// Whether an app says it's a game: by its category, or by asking for Game Mode. A game draws for
+/// speed and often holds the pointer itself, neither of which a picture of another display is kind
+/// to. Read once for each app, from any thread.
+private func isGame(at url: URL?) -> Bool {
+    guard let url else { return false }
+    if let known = gameVerdicts({ $0[url] }) { return known }
+    let info = Bundle(url: url)?.infoDictionary ?? [:]
+    let category = info["LSApplicationCategoryType"] as? String ?? ""
+    let game = category.hasPrefix("public.app-category.") && category.hasSuffix("games")
+        || info["LSSupportsGameMode"] as? Bool == true || info["GCSupportsGameMode"] as? Bool == true
+    gameVerdicts { $0[url] = game }
+    return game
+}
+
 // MARK: - Threads
 
 /// A thread with a run loop of its own, for event taps: every event waits on its tap's answer,
@@ -516,6 +553,11 @@ private let clickLoop = runLoopThread("TrueFullScreen.clicks")
 private let pointerLoop = runLoopThread("TrueFullScreen.pointer")
 /// For listening only: nothing waits on it.
 private let inputLoop = runLoopThread("TrueFullScreen.input")
+/// For the keys for full screen: every key press waits on it, so it's kept apart from the clicks,
+/// which can wait on an app.
+private let keyLoop = runLoopThread("TrueFullScreen.keys")
+/// Whether a stage is holding the pointer, for anything else that would move it.
+private let pointerFenced = Locked(false)
 
 private func add(_ taps: [CFMachPort], to loop: CFRunLoop) {
     for tap in taps { CFRunLoopAddSource(loop, CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes) }
@@ -667,15 +709,14 @@ final class StandIn: NSObject, NSWindowDelegate {
     /// Where the window sits in the stage's picture, from its top left, for one that's sized there
     /// rather than full screen: its still goes there as it fades into the picture.
     var lands: CGRect?
-    private let stillSize: CGSize?
+    private var stillSize: CGSize?
 
-    init(screen: NSScreen, over rect: CGRect, image: CGImage?, title: String, feed: Feed) {
+    init(screen: NSScreen, over rect: CGRect, title: String, feed: Feed) {
         full = screen.frame
         panelID = screen.displayID
         safe = full
         picture = full
         home = appKit(rect)
-        stillSize = image.map { CGSize(width: $0.width, height: $0.height) }
         sink = Sink([live, bandLive])
         self.feed = feed
         band = PinnedWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
@@ -712,7 +753,6 @@ final class StandIn: NSObject, NSWindowDelegate {
         live.contentsGravity = .resize
         live.opacity = 0
         still.contentsGravity = .resizeAspect
-        still.contents = image
         window.setFrame(home, display: false)
 
         // Both in the panel's own colors, which the stage's are too, so the picture shows unconverted.
@@ -738,7 +778,12 @@ final class StandIn: NSObject, NSWindowDelegate {
         bandLive.actions = quiet
         bandLive.contentsGravity = .resize
         band.contentView?.layer?.addSublayer(bandLive)
-        // Right over the window it stands in for.
+    }
+
+    /// Puts it right over the window it stands in for, showing that window's picture.
+    func show(_ image: CGImage?) {
+        stillSize = image.map { CGSize(width: $0.width, height: $0.height) }
+        still.contents = image
         window.orderFrontRegardless()
     }
 
@@ -1429,6 +1474,7 @@ final class Fence: @unchecked Sendable {
             return
         }
         confined = on
+        pointerFenced { $0 = on }
         let point = pointer()
         if on, visiting, panel.contains(point), openings.contains(where: { $0.contains(point) }) {
             lock.unlock()
@@ -1655,7 +1701,7 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
                 descriptor.maxPixelsWide = UInt32(pixelWidth)
                 descriptor.maxPixelsHigh = UInt32(pixelHeight)
                 descriptor.sizeInMillimeters = size
-                descriptor.vendorID = 0x5446
+                descriptor.vendorID = stageVendor
                 descriptor.productID = 0x4653
                 descriptor.serialNum = serial
                 // Display P3, like the panel.
@@ -1713,16 +1759,20 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
         fence.install()
         // Every app learns of the display in its own time; this one knowing it, in place, is the earliest.
         let id = id
-        known = Task {
+        known = Task { [weak self] in
             for _ in 0..<500 where !NSScreen.screens.contains(where: { $0.displayID == id && $0.frame == appKit(CGDisplayBounds(id)) }) {
                 try? await Task.sleep(for: .milliseconds(2))
             }
+            self?.knownAt = .now
             return .now
         }
     }
 
     /// When this app learned of the display.
     private var known: Task<ContinuousClock.Instant, Never>?
+    private var knownAt: ContinuousClock.Instant?
+    /// Whether apps have surely caught up with the display: a window can go there at once.
+    var isSettled: Bool { knownAt.map { $0.advanced(by: .milliseconds(300)) <= .now } ?? false }
     /// The other displays, as they were when the display was last put clear of them.
     private var placedAmong: [CGRect]
 
@@ -1803,9 +1853,7 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
             windows.filter { $0.frame.intersects(bounds) && ($0.windowLayer <= desktop || $0.title == "StatusIndicator") }
         }
         let excluded = leftOut(windows)
-        let stream = SCStream(filter: SCContentFilter(display: target, excludingWindows: excluded), configuration: configuration, delegate: nil)
-        guard (try? stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frames)) != nil,
-              (try? await stream.startCapture()) != nil else {
+        guard let stream = await Self.stream(of: target, without: excluded, configuration, to: self, on: frames) else {
             note("capture didn't start")
             return false
         }
@@ -1833,12 +1881,23 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
         return true
     }
 
+    /// Makes a stream and starts it, off the main thread: making one alone takes tens of milliseconds
+    /// (it brings up audio too), and a stand-in is usually growing meanwhile.
+    private nonisolated static func stream(of display: SCDisplay, without excluded: [SCWindow], _ configuration: SCStreamConfiguration,
+                                           to output: SCStreamOutput, on queue: DispatchQueue) async -> SCStream? {
+        let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: excluded), configuration: configuration, delegate: nil)
+        guard (try? stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: queue)) != nil,
+              (try? await stream.startCapture()) != nil else { return nil }
+        return stream
+    }
+
     /// Waits until an app has surely caught up with the display coming online: a window landing on
     /// a display its app doesn't know yet can bring the app down.
     func settle(_ pid: pid_t) async {
         let born = await known?.value ?? .now
         try? await Task.sleep(until: born.advanced(by: .milliseconds(300)), clock: .continuous)
-        await caughtUp(pid)
+        // A display the app has long known needs no asking: it's asked about its window next anyway.
+        if born.advanced(by: .seconds(2)) > .now { await caughtUp(pid) }
     }
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -1954,27 +2013,113 @@ final class Stage: NSObject, SCStreamOutput, FenceDelegate {
 /// A click or key press, as far as telling what put a window in full screen goes.
 struct Input {
     enum Kind {
-        /// With ⌘, or 🌐F: a menu's key, the window's own way into full screen among them.
-        case key(command: Bool)
+        /// With ⌘, or 🌐F: a menu's key, the window's own way into full screen among them. `toggle`
+        /// for ⌃⌘F itself.
+        case key(command: Bool, toggle: Bool)
         /// On a window of this app (0 if none was found), at this level. `secondary` for a right click
-        /// or a Control-click, which brings up a contextual menu.
-        case click(pid: pid_t, layer: Int, secondary: Bool)
+        /// or a Control-click, which brings up a contextual menu. `button` for one on a window's green
+        /// button.
+        case click(pid: pid_t, layer: Int, secondary: Bool, button: Bool)
     }
     let time: CFAbsoluteTime
     let kind: Kind
+    /// The panel's full screen Spaces at the time: one already there didn't come of this.
+    let spaces: Set<Int>
+}
+
+/// Whether a window found in its app's own full screen is to go into true full screen, and why or
+/// why not, going by what was last pressed or clicked (`cause`, and `before` it) by the time its
+/// full screen Space was first seen (`seen`), and when its app started (`launched`).
+func whoAsked(cause: Input?, before: Input?, seen: CFAbsoluteTime, launched: CFAbsoluteTime?, pid: pid_t) -> (adopt: Bool, why: String) {
+    // Opened in full screen by its app as it started: nothing pressed or clicked before that could
+    // have been in it.
+    if let launched, seen - launched < 20, cause.map({ $0.time < launched }) ?? true { return (true, "its app opened it there") }
+    guard let cause else { return (false, seen == .infinity ? "it was there already" : "nothing seen to ask for it") }
+    /// In an ordinary window of the app's, and whether on its green button.
+    let inside = { (input: Input) -> (Bool, button: Bool) in
+        if case .click(pid, 0, _, let button) = input.kind { return (true, button) }
+        return (false, false)
+    }
+    switch cause.kind {
+    case .key(let command, _):
+        return command ? (true, "its key") : (false, "a key pressed in it")
+    case .click(_, let layer, _, _):
+        // The green button, where its click wasn't taken over as it came.
+        if inside(cause).button { return (true, "its green button") }
+        if inside(cause).0 { return (false, "a click in it") }
+        // In another app's window, or nowhere that could be made out: nothing to do with this one.
+        if layer <= 0 { return (false, "a click elsewhere") }
+        // An item of a menu: the window's own contextual menu (a video's Full Screen), or its app's.
+        if let before, case .click(_, _, true, _) = before.kind, inside(before).0 { return (false, "its contextual menu") }
+        // Its app's menus, the menu under its green button, the Dock.
+        return (true, "its menu")
+    }
+}
+
+/// The key for full screen: F, with ⌃⌘ or 🌐.
+private let fullScreenKey: Int64 = 3
+/// How Accessibility tells a menu item's key is ⌃⌘ with its letter, or 🌐 with it.
+private let controlCommand = 4, globe = 24
+
+/// Whether an app's menus have ⌃⌘F as its way into full screen, or nil if they couldn't be read,
+/// or not through in time: each item is asked of the app.
+private func hasFullScreenKey(_ app: AXUIElement, until deadline: CFAbsoluteTime) -> Bool? {
+    guard let bar = element(app, kAXMenuBarAttribute), let menus = value(bar, kAXChildrenAttribute) as? [AXUIElement],
+          menus.count > 1 else { return nil }
+    var found = false
+    for top in menus.dropFirst() {
+        guard let menu = (value(top, kAXChildrenAttribute) as? [AXUIElement])?.first,
+              let items = value(menu, kAXChildrenAttribute) as? [AXUIElement] else { continue }
+        for item in items {
+            guard CFAbsoluteTimeGetCurrent() < deadline else { return nil }
+            guard (value(item, kAXMenuItemCmdCharAttribute) as? String)?.uppercased() == "F",
+                  let modifiers = value(item, kAXMenuItemCmdModifiersAttribute) as? Int else { continue }
+            if modifiers == globe {
+                found = true
+            } else if modifiers == controlCommand {
+                // The key is this item's, whatever else there is.
+                let title = (value(item, kAXTitleAttribute) as? String ?? "").lowercased()
+                return title.contains("full screen") || title.contains("fullscreen")
+            }
+        }
+    }
+    return found
+}
+
+/// The frontmost window at a point that isn't this app's own, as the window server lists them.
+private func windowInfo(at point: CGPoint) -> [String: Any]? {
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    let own = getpid()
+    return windows.first { info in
+        info[kCGWindowOwnerPID as String] as? pid_t != own && (info[kCGWindowAlpha as String] as? Double ?? 1) > 0
+            && windowBounds(info)?.contains(point) == true
+    }
 }
 
 /// Watches for green-button clicks on the panel, on a thread of its own: every click on the Mac
-/// waits for the answer, so it must never wait on anything else.
+/// waits for the answer, so it must never wait on anything else. And for the keys for full screen,
+/// on another.
 final class Clicks: @unchecked Sendable {
     struct State {
         var enabled = true
         var excluded: Set<String> = []
+        /// Whether games go into true full screen too, and the apps that always do, games or not.
+        var games = false
+        var always: Set<String> = []
+        /// Apps seen to go full screen on ⌃⌘F.
+        var keys: Set<String> = []
         /// Windows that get the app's own full screen.
         var ignored: [AXUIElement] = []
         /// Windows sized to fill the stage, whose green button brings them back.
         var sized: [AXUIElement] = []
         var panel: CGRect?
+        var panelID: CGDirectDisplayID?
+
+        /// Whether an app's windows keep to its own full screen: unchecked under Apps, or a game.
+        func leavesOut(_ app: NSRunningApplication?) -> Bool {
+            guard let id = app?.bundleIdentifier else { return true }
+            return excluded.contains(id) || !games && !always.contains(id) && isGame(at: app?.bundleURL)
+        }
     }
 
     let state = Locked(State())
@@ -1985,46 +2130,136 @@ final class Clicks: @unchecked Sendable {
     var onLeave: ((AXUIElement) -> Void)?
     private var tap: CFMachPort?
     private var listener: CFMachPort?
+    private var keyListener: CFMachPort?
+    private var shortcut: CFMachPort?
     /// The click thread's.
     private var swallowMouseUp = false
+    /// The input thread's: the panel's full screen Spaces, and when they were read.
+    private var spaces: (now: Set<Int>, at: CFAbsoluteTime) = ([], 0)
+    /// The key thread's: whether the key for full screen being held was taken over.
+    private var swallowRepeats = false
+    /// By app, whether its menus have ⌃⌘F as its way into full screen.
+    private let toggles = Locked<[pid_t: Bool]>([:])
 
     func install() {
         guard tap == nil, AXIsProcessTrusted() else { return }
+        let info = Unmanaged.passUnretained(self).toOpaque()
         let clicks: [CGEventType] = [.leftMouseDown, .leftMouseUp]
         tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                                eventsOfInterest: clicks.reduce(0) { $0 | 1 << $1.rawValue },
-                                callback: clickCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
+                                eventsOfInterest: clicks.reduce(0) { $0 | 1 << $1.rawValue }, callback: clickCallback, userInfo: info)
         if let tap { add([tap], to: clickLoop) }
-        let heard: [CGEventType] = [.leftMouseDown, .rightMouseDown, .keyDown]
-        listener = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
-                                     eventsOfInterest: heard.reduce(0) { $0 | 1 << $1.rawValue },
-                                     callback: inputCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
-        if let listener { add([listener], to: inputLoop) }
+        // Clicks are heard once macOS has marked each with the window it's for: where the other taps
+        // sit, it hasn't yet, and every click would seem to have gone nowhere. Keys, as they come.
+        let heard: [CGEventType] = [.leftMouseDown, .rightMouseDown]
+        listener = CGEvent.tapCreate(tap: .cgAnnotatedSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                     eventsOfInterest: heard.reduce(0) { $0 | 1 << $1.rawValue }, callback: inputCallback, userInfo: info)
+        keyListener = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                        eventsOfInterest: 1 << CGEventType.keyDown.rawValue, callback: inputCallback, userInfo: info)
+        add([listener, keyListener].compactMap { $0 }, to: inputLoop)
+        shortcut = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                     eventsOfInterest: 1 << CGEventType.keyDown.rawValue, callback: shortcutCallback, userInfo: info)
+        if let shortcut { add([shortcut], to: keyLoop) }
+        note("taps: clicks \(tap != nil), heard \(listener != nil), keys heard \(keyListener != nil), keys \(shortcut != nil)")
     }
 
     /// Notes a click or key press, and for a click, the window it went to, while it's still up: a
     /// menu goes as soon as an item in it is chosen.
     fileprivate func heard(_ type: CGEventType, _ event: CGEvent) {
+        let now = CFAbsoluteTimeGetCurrent()
+        // The Spaces as they are before anything comes of it: read afresh for a click, and twice a
+        // second at most while typing.
+        if type != .keyDown || now - spaces.at > 0.5, let panel = state({ $0.panelID }) { spaces = (fullScreenSpaces(on: panel), now) }
         let kind: Input.Kind
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            if let listener { CGEvent.tapEnable(tap: listener, enable: true) }
+            for tap in [listener, keyListener] { tap.map { CGEvent.tapEnable(tap: $0, enable: true) } }
             return
         case .keyDown:
             let flags = event.flags
-            kind = .key(command: flags.contains(.maskCommand)
-                        || flags.contains(.maskSecondaryFn) && event.getIntegerValueField(.keyboardEventKeycode) == 3)
+            let full = event.getIntegerValueField(.keyboardEventKeycode) == fullScreenKey
+            kind = .key(command: flags.contains(.maskCommand) || full && flags.contains(.maskSecondaryFn),
+                        toggle: full && flags.intersection(shortcutModifiers) == [.maskControl, .maskCommand])
         case .leftMouseDown, .rightMouseDown:
             let handling = event.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent)
             let under = handling != 0 ? handling : event.getIntegerValueField(.mouseEventWindowUnderMousePointer)
-            let info = under == 0 ? nil : (CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(truncatingIfNeeded: under)) as? [[String: Any]])?.first
+            // The window the event says it's for, or failing that, the one it landed on.
+            let info = (under == 0 ? nil : (CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(truncatingIfNeeded: under)) as? [[String: Any]])?.first)
+                ?? windowInfo(at: event.location)
+            let secondary = type == .rightMouseDown || event.flags.contains(.maskControl)
+            // A green button's click that wasn't taken over as it came (its app too busy to say what
+            // was under it, say) is still the window's own way into full screen.
+            var button = false
+            var hit: AXUIElement?
+            let point = event.location
+            if !secondary, nearWindowButtons(point),
+               AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &hit) == .success, let hit {
+                button = [kAXFullScreenButtonSubrole, kAXZoomButtonSubrole].contains(value(hit, kAXSubroleAttribute) as? String ?? "")
+            }
             kind = .click(pid: info?[kCGWindowOwnerPID as String] as? pid_t ?? 0, layer: info?[kCGWindowLayer as String] as? Int ?? -1,
-                          secondary: type == .rightMouseDown || event.flags.contains(.maskControl))
+                          secondary: secondary, button: button)
         default:
             return
         }
-        let input = Input(time: CFAbsoluteTimeGetCurrent(), kind: kind)
-        inputs { $0 = Array(($0 + [input]).suffix(4)) }
+        let input = Input(time: now, kind: kind, spaces: spaces.now)
+        inputs { $0 = Array(($0 + [input]).suffix(8)) }
+    }
+
+    /// Takes over the keys for full screen, ⌃⌘F and 🌐F, where they'd take the window in front into
+    /// its app's own: it goes straight into true full screen instead, as from its green button, rather
+    /// than into the app's own first and from there. Returns true to swallow the key.
+    fileprivate func pressed(_ type: CGEventType, _ event: CGEvent) -> Bool {
+        guard type == .keyDown else {
+            if let shortcut, type == .tapDisabledByTimeout || type == .tapDisabledByUserInput { CGEvent.tapEnable(tap: shortcut, enable: true) }
+            return false
+        }
+        guard event.getIntegerValueField(.keyboardEventKeycode) == fullScreenKey else { return false }
+        let flags = event.flags.intersection([.maskControl, .maskCommand, .maskAlternate, .maskShift, .maskSecondaryFn])
+        let byGlobe = flags == .maskSecondaryFn
+        guard byGlobe || flags == [.maskControl, .maskCommand] else { return false }
+        // Held down, it repeats: the first press said where it goes.
+        if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return swallowRepeats }
+        swallowRepeats = false
+        let state = state { $0 }
+        var pid: pid_t = 0
+        guard state.enabled, let panel = state.panel, CGPreflightScreenCaptureAccess(),
+              let app = element(systemWide, kAXFocusedApplicationAttribute), AXUIElementGetPid(app, &pid) == .success, pid != getpid()
+        else { return false }
+        // A window with a full screen of its own to go into, on the panel, and not one left to it.
+        let running = NSRunningApplication(processIdentifier: pid)
+        guard let window = element(app, kAXFocusedWindowAttribute), isStandardWindow(window),
+              element(window, kAXFullScreenButtonAttribute) != nil, fullScreen(window) == false,
+              !state.ignored.contains(where: { CFEqual($0, window) }),
+              let rect = frame(of: window), panel.contains(CGPoint(x: rect.midX, y: rect.midY)),
+              let id = running?.bundleIdentifier, !state.leavesOut(running),
+              byGlobe || state.keys.contains(id) || togglesFullScreen(app, pid: pid) else { return false }
+        swallowRepeats = true
+        DispatchQueue.main.async { self.onTakeOver?(window, pid, false) }
+        return true
+    }
+
+    /// Whether ⌃⌘F is an app's way into full screen, going by its menus: the key of an item named
+    /// for full screen, or the other key of one whose key is 🌐F, as it is in the menus AppKit fills
+    /// in. Anything else there on ⌃⌘F, or nothing, and the key is the app's. Asked once for each app,
+    /// and left for another time if it's slow to answer.
+    private func togglesFullScreen(_ app: AXUIElement, pid: pid_t) -> Bool {
+        if let known = toggles({ $0[pid] }) { return known }
+        let toggles = toggles
+        let keep = { (found: Bool) in
+            toggles {
+                if $0.count > 200 { $0.removeAll() }
+                $0[pid] = found
+            }
+        }
+        if let found = hasFullScreenKey(app, until: CFAbsoluteTimeGetCurrent() + 0.12) {
+            keep(found)
+            return found
+        }
+        // Slow to answer: the key is its app's for now, and its menus are read through meanwhile.
+        keep(false)
+        DispatchQueue.global(qos: .utility).async {
+            if let found = hasFullScreenKey(app, until: CFAbsoluteTimeGetCurrent() + 5) { keep(found) }
+        }
+        return false
     }
 
     /// Takes over green-button clicks on the notched display. Returns true to swallow the event.
@@ -2080,7 +2315,7 @@ final class Clicks: @unchecked Sendable {
               !sized || isStandardWindow(window) && isSettable(window, kAXSizeAttribute),
               !state.ignored.contains(where: { CFEqual($0, window) }),
               AXUIElementGetPid(window, &pid) == .success, pid != getpid(), !isFullScreen(window),
-              let id = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier, !state.excluded.contains(id),
+              !state.leavesOut(NSRunningApplication(processIdentifier: pid)),
               CGPreflightScreenCaptureAccess() else { return nil }
         return (window, pid, sized)
     }
@@ -2091,8 +2326,113 @@ private let clickCallback: CGEventTapCallBack = { _, type, event, info in
     return clicks.handle(type, event) ? nil : Unmanaged.passUnretained(event)
 }
 
+private let shortcutCallback: CGEventTapCallBack = { _, type, event, info in
+    let clicks = Unmanaged<Clicks>.fromOpaque(info!).takeUnretainedValue()
+    return clicks.pressed(type, event) ? nil : Unmanaged.passUnretained(event)
+}
+
 private let inputCallback: CGEventTapCallBack = { _, type, event, info in
     Unmanaged<Clicks>.fromOpaque(info!).takeUnretainedValue().heard(type, event)
+    return Unmanaged.passUnretained(event)
+}
+
+// MARK: - Top edges
+
+/// The virtual display's maker, as it tells macOS.
+private let stageVendor: UInt32 = 0x5446
+/// How far the pointer is pushed on past a top edge it stops at before it goes over after all.
+private let pushThrough: CGFloat = 100
+
+/// Whether a display's menu bar stays out of the way until the pointer comes to its top: over a
+/// full screen window, unless it's set to show there, or on the desktop, if it's set to hide there.
+private func hidesMenuBar(_ display: CGDirectDisplayID) -> Bool {
+    guard let displays = copyManagedDisplaySpaces?(connection)?.takeRetainedValue() as? [[String: Any]] else { return false }
+    let id = identifier(of: display)
+    // One for all of them, when displays don't have Spaces of their own.
+    guard let match = displays.first(where: { $0["Display Identifier"] as? String == id }) ?? (displays.count == 1 ? displays.first : nil),
+          let current = match["Current Space"] as? [String: Any] else { return false }
+    let setting = { (key: String) in CFPreferencesCopyAppValue(key as CFString, kCFPreferencesAnyApplication) as? Bool }
+    if current["type"] as? Int == 4 { return setting("AppleMenuBarVisibleInFullscreen") != true }
+    return setting("_HIHideMenuBar") == true
+}
+
+/// A display's top edge that runs along another display above it isn't an edge at all: the pointer
+/// goes straight on over, and the menu bar and title bar of a full screen window there, which come in
+/// only once it rests at the very top, never do. Where they would, the pointer stops at that edge as
+/// at any other, and goes over once pushed on a little further. On the input thread.
+final class TopEdges: @unchecked Sendable {
+    struct State {
+        var enabled = true
+        /// Every display but the stage, which keeps its own top edge clear.
+        var displays: [(id: CGDirectDisplayID, rect: CGRect)] = []
+    }
+
+    let state = Locked(State())
+    private var tap: CFMachPort?
+    /// The input thread's.
+    private var previous = CGPoint.zero
+    private var held: (edge: CGRect, push: CGFloat, since: CFAbsoluteTime, last: CFAbsoluteTime)?
+
+    func install() {
+        guard tap == nil, AXIsProcessTrusted() else { return }
+        // Moves only: something dragged goes over as it always has.
+        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                eventsOfInterest: 1 << CGEventType.mouseMoved.rawValue,
+                                callback: topEdgeCallback, userInfo: Unmanaged.passUnretained(self).toOpaque())
+        if let tap { add([tap], to: inputLoop) }
+    }
+
+    fileprivate func moved(_ type: CGEventType, _ event: CGEvent) {
+        guard type == .mouseMoved else {
+            if let tap, type == .tapDisabledByTimeout || type == .tapDisabledByUserInput { CGEvent.tapEnable(tap: tap, enable: true) }
+            return
+        }
+        let point = event.location
+        let from = previous
+        previous = point
+        let state = state { $0 }
+        // A stage holding the pointer has it all to itself.
+        guard state.enabled, !pointerFenced({ $0 }) else {
+            held = nil
+            return
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        let upward = max(0, -CGFloat(event.getDoubleValueField(.mouseEventDeltaY)))
+        if var hold = held {
+            let edge = hold.edge
+            if point.y < edge.minY, point.x >= edge.minX, point.x < edge.maxX {
+                // Pushed on up: over it goes, once pushed far enough for long enough. A rest in between,
+                // and the push starts over.
+                if now - hold.last > 0.5 { (hold.push, hold.since) = (0, now) }
+                hold.push += upward
+                hold.last = now
+                guard hold.push < pushThrough || now - hold.since < 0.25 else {
+                    held = nil
+                    return
+                }
+                held = hold
+                return stop(at: CGPoint(x: point.x, y: edge.minY))
+            }
+            // Along the top, where the menu bar comes in, it stays ready to stop again.
+            if edge.contains(point), point.y < edge.minY + 60 { return }
+            held = nil
+        }
+        // Up through a display's top edge, into one above it, where that display's menu bar would come in.
+        guard point.y < from.y, let edge = state.displays.first(where: { $0.rect.contains(from) }), !edge.rect.contains(point),
+              point.y < edge.rect.minY, point.x >= edge.rect.minX, point.x < edge.rect.maxX,
+              state.displays.contains(where: { $0.rect.contains(point) }), hidesMenuBar(edge.id) else { return }
+        held = (edge.rect, upward, now, now)
+        stop(at: CGPoint(x: point.x, y: edge.rect.minY))
+    }
+
+    private func stop(at point: CGPoint) {
+        warp(point)
+        previous = point
+    }
+}
+
+private let topEdgeCallback: CGEventTapCallBack = { _, type, event, info in
+    Unmanaged<TopEdges>.fromOpaque(info!).takeUnretainedValue().moved(type, event)
     return Unmanaged.passUnretained(event)
 }
 
@@ -2178,11 +2518,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let defaults = UserDefaults.standard
     private let clicks = Clicks()
+    private let topEdges = TopEdges()
     private var targets: [Target] = [] { didSet { publish() } }
     private var entering: [AXUIElement] = []
     private var ignored: [AXUIElement] = [] { didSet { publish() } }
     /// Windows in a full screen their page or app asked for, left in it until they come out of it.
     private var leftAlone: [(window: AXUIElement, pid: pid_t)] = []
+    /// A full screen Space of the panel's as it was first seen: when, and what had last been pressed
+    /// or clicked by then, and before that. Nothing, for one whose coming wasn't seen.
+    private struct Arrival {
+        var at: CFAbsoluteTime
+        var cause: Input?
+        var before: Input?
+    }
+    private var arrivals: [Int: Arrival] = [:]
+    /// Looking for a window gone full screen by itself, and whether to look again once that's through.
+    private var adopting = false
+    private var adoptDue = false
     private var stage: Stage?
     private var opening = false { didSet { if !opening { stageSettled() } } }
     private var closing = false { didSet { if !closing { stageSettled() } } }
@@ -2196,6 +2548,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var missionControl = false
     private var swiping = false
     private var checking = false
+    /// Windows changed while a stand-in was on its way in or out: looked at once it's there.
+    private var windowsDue = false
     private var checkDue = false
     private var nextLook = DispatchTime(uptimeNanoseconds: 0)
     private var lookDue = false
@@ -2249,7 +2603,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Apps whose windows go into true full screen as they open.
     private var always: Set<String> {
         get { Set(defaults.stringArray(forKey: "always") ?? []) }
-        set { defaults.set(newValue.sorted(), forKey: "always") }
+        set { defaults.set(newValue.sorted(), forKey: "always"); publish() }
+    }
+
+    /// Whether games go into true full screen too. They keep their own otherwise.
+    private var inGames: Bool {
+        get { defaults.bool(forKey: "games") }
+        set { defaults.set(newValue, forKey: "games"); publish() }
+    }
+
+    /// Apps seen to take ⌃⌘F for their way into full screen, whatever their menus call it.
+    private var keys: Set<String> {
+        get { Set(defaults.stringArray(forKey: "keys") ?? []) }
+        set { defaults.set(newValue.sorted(), forKey: "keys"); publish() }
+    }
+
+    /// Whether an app's windows keep to its own full screen: unchecked under Apps, or a game.
+    private func leavesOut(_ app: NSRunningApplication?) -> Bool {
+        guard let id = app?.bundleIdentifier else { return true }
+        return excluded.contains(id) || !inGames && !always.contains(id) && isGame(at: app?.bundleURL)
     }
 
     /// Which virtual display to make. A new one whenever the last didn't go away cleanly, so
@@ -2290,11 +2662,19 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         StandIn.onStill = { [weak self] in
             MainActor.assumeIsolated {
-                if self?.updateDue == true { self?.update() }
+                guard let self else { return }
+                if self.updateDue { self.update() }
+                if self.windowsDue {
+                    self.windowsDue = false
+                    self.windowsChanged()
+                }
             }
         }
         publish()
         clicks.install()
+        topEdges.install()
+        // Whatever is in full screen already was there before anything could be seen to ask for it.
+        noteArrivals(unseen: true)
 
         // A plain kill quits properly too, so full screen windows get handed back.
         signal(SIGTERM, SIG_IGN)
@@ -2309,9 +2689,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.image = glyph(on: enabled)
 
         let workspace = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didTerminateApplicationNotification] {
-            workspace.addObserver(self, selector: #selector(update), name: name, object: nil)
-        }
+        workspace.addObserver(self, selector: #selector(spaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        workspace.addObserver(self, selector: #selector(update), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         workspace.addObserver(self, selector: #selector(activated), name: NSWorkspace.didActivateApplicationNotification, object: nil)
         workspace.addObserver(self, selector: #selector(launched), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
@@ -2350,15 +2729,26 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Tells the click thread what it needs to know.
     private func publish() {
-        let panel = NSScreen.notched.map { CGDisplayBounds($0.displayID) }
+        let panelID = NSScreen.notched?.displayID
+        let panel = panelID.map(CGDisplayBounds)
         let (enabled, excluded, ignored) = (enabled, excluded, ignored)
+        let (games, always, keys) = (inGames, always, keys)
         let sized = targets.filter { $0.sized && !$0.leaving }.map(\.window)
         clicks.state {
             $0.enabled = enabled
             $0.excluded = excluded
+            $0.games = games
+            $0.always = always
+            $0.keys = keys
             $0.ignored = ignored
             $0.sized = sized
             $0.panel = panel
+            $0.panelID = panelID
+        }
+        let displays = activeDisplays().filter { CGDisplayVendorNumber($0) != stageVendor }.map { (id: $0, rect: CGDisplayBounds($0)) }
+        topEdges.state {
+            $0.enabled = enabled
+            $0.displays = displays
         }
     }
 
@@ -2437,7 +2827,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func accessibilityChanged() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.clicks.install() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            self.clicks.install()
+            self.topEdges.install()
+        }
     }
 
     // MARK: Full screen
@@ -2478,9 +2871,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and would stall an animation. Then the window goes full screen there while the stand-in
         // grows into its Space.
         guard let stage = await openStage(on: screen, sized: sized) else { return await giveUp(window, id: id, sized: sized) }
-        let standIn = StandIn(screen: screen, over: home, image: await image, title: app?.localizedName ?? "", feed: stage.feed)
-        note("growing after \(elapsed())")
-        async let entered = standIn.enter()
+        // Made while the window is pictured, and put over it once it is.
+        let standIn = StandIn(screen: screen, over: home, title: app?.localizedName ?? "", feed: stage.feed)
+        standIn.show(await image)
+        // On a display its app doesn't know yet, the window has to wait before it goes there: the stand-in
+        // grows meanwhile. On one it knows, the window is there and asked to go full screen within a
+        // moment, and the stand-in starts just after that, not before: the window server holds up
+        // whatever else it's drawing as it starts a window's way into full screen, and a stand-in at
+        // its fastest then would stop and jump.
+        let together = !sized && stage.isSettled
+        var growing: Task<Bool, Never>?
+        if !together {
+            note("growing after \(elapsed())")
+            growing = Task { await standIn.enter() }
+        }
         await stage.settle(pid)
         if sized {
             if stage.top == 0 {
@@ -2502,7 +2906,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 await place(window, at: stage.centered(size))
             }
         } else {
-            await place(window, at: home.origin - stage.panel.origin + stage.bounds.origin)
+            await place(window, at: home.origin - stage.panel.origin + stage.bounds.origin, still: true)
         }
         let placed = await apart { frame(of: window) }
         let moved = placed.map { sized ? $0.width < stage.fill.width + 2 && $0.height < stage.fill.height + 2
@@ -2514,7 +2918,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             note("won't move there: at \(frame(of: window).map { "\($0)" } ?? "?"), Spaces \(spaces(of: [id]))")
             setSize(window, home.size)
             move(window, to: home.origin)
-            _ = await entered
+            _ = await growing?.value
             standIn.close()
             return await giveUp(window, id: id, sized: sized)
         }
@@ -2524,10 +2928,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         beat(true)
         let desk = spaces(of: [id])
         let started = ContinuousClock.now
-        let went = sized ? true : await goFullScreen(window)
+        async let asked = sized ? true : await goFullScreen(window)
+        if growing == nil {
+            try? await Task.sleep(for: .milliseconds(50))
+            note("growing after \(elapsed())")
+            growing = Task { await standIn.enter() }
+        }
+        let went = await asked
         // No Space for it on the panel, or it won't go full screen there: back out. One that says it
         // won't, rather than being too busy to say, gets what its green button does next time.
-        let inSpace = await entered
+        let inSpace = await growing?.value ?? false
         if !went, fullScreen(window) == false { ignored.append(window) }
         guard went, inSpace else { return leave(window, went ? "no Space on the panel" : "won't go full screen") }
         // Its own way into full screen there, out of sight, takes at least this long, and lasts until the
@@ -2627,53 +3037,129 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return made
     }
 
-    /// Windows that went full screen another way (keyboard, menu, relaunch) are moved over too,
-    /// once their own animation is done. Not ones whose page or app put them there.
-    private func adoptFullScreenWindow() {
-        // Out of the full screen its page asked for: from now on it goes the way any other window does.
-        leftAlone.removeAll { fullScreen($0.window) == false || isGone($0.window, of: $0.pid) }
-        guard enabled, allowed, let screen = NSScreen.notched, let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier != getpid(), let id = app.bundleIdentifier, !excluded.contains(id),
-              let window = element(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute),
-              !isBusy(window), isFullScreen(window), let origin = frame(of: window)?.origin, CGDisplayBounds(screen.displayID).contains(origin)
-        else { return }
-        if let why = askedFromInside(app.processIdentifier) {
-            note("leave \(id) in its own full screen: \(why)")
-            leftAlone.append((window, app.processIdentifier))
+    /// Notes the panel's full screen Spaces as they come, each with what was last pressed or clicked
+    /// before it: that's what put its window there. Looked at whenever Spaces change, so a Space is
+    /// new within a moment of its coming, and nothing from after it was there is taken for its cause:
+    /// every click and key press carries the Spaces there were at the time. `unseen` for Spaces whose
+    /// coming couldn't have been seen, or whose windows were left where they were on purpose.
+    private func noteArrivals(unseen: Bool = false) {
+        guard let screen = NSScreen.notched else { return }
+        let there = fullScreenSpaces(on: screen.displayID)
+        guard !unseen else {
+            arrivals = Dictionary(uniqueKeysWithValues: there.map { ($0, Arrival(at: .infinity)) })
             return
         }
+        let now = CFAbsoluteTimeGetCurrent()
+        var new = false
+        for space in there where arrivals[space] == nil {
+            // Not from after it was there, nor from long before: a page may go full screen only within
+            // a few seconds of a click or a key.
+            let recent = clicks.inputs { $0 }.filter { now - $0.time < 6 && !$0.spaces.contains(space) }
+            arrivals[space] = Arrival(at: now, cause: recent.last, before: recent.dropLast().last)
+            new = true
+        }
+        arrivals = arrivals.filter { there.contains($0.key) }
+        // Its window may say it's full screen only a moment later, with nothing else to announce it.
+        if new { lookAgain(after: [0.3, 0.8, 1.6]) }
+    }
+
+    /// Looks for a window gone full screen again in a moment, apart from everything else an update does.
+    private func lookAgain(after delays: [Double]) {
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [self] in
+                if StandIn.moving == 0, !missionControl { adoptFullScreenWindow() }
+            }
+        }
+    }
+
+    /// The panel went to another Space: a window on its way into full screen may have its Space, or
+    /// say it's there, only a moment after.
+    @objc private func spaceChanged() {
+        update()
+        lookAgain(after: [0.35, 1])
+    }
+
+    /// Whether a window in its app's own full screen goes into true full screen, and why or why not.
+    /// It does if what put it there was the window's own way: its key (⌃⌘F, 🌐F or another with ⌘),
+    /// its menu item, or its app opening it there as it starts. It doesn't if the window itself asked:
+    /// a video's full screen button, its F key, its contextual menu, a game's own key. Taken out of
+    /// that full screen to go into true full screen, the window would end the video's with it, and
+    /// go into true full screen without it. Nor does it when nothing was seen to ask: better left
+    /// where it is than taken out of a full screen it may have asked for itself.
+    private func verdict(on id: CGWindowID, of app: NSRunningApplication, panel: CGDirectDisplayID) -> (adopt: Bool, why: String, cause: Input?)? {
+        let own = spaces(of: [id])
+        // Not in its Space yet, on its way there: asked again in a moment. One that can't be told
+        // apart from its app's others is taken to be in the Space that's up.
+        guard let arrival = arrivals.first(where: { own.contains($0.key) })?.value
+                ?? (id == 0 ? currentSpace(on: panel).flatMap({ arrivals[$0] }) : nil) else { return nil }
+        let (adopt, why) = whoAsked(cause: arrival.cause, before: arrival.before, seen: arrival.at,
+                                    launched: app.launchDate?.timeIntervalSinceReferenceDate, pid: app.processIdentifier)
+        return (adopt, why, arrival.cause)
+    }
+
+    /// Windows that went full screen another way (keyboard, menu, relaunch) are moved over too,
+    /// once their own animation is done. Not ones whose page or app put them there: decided once,
+    /// as each is first found there. One look at a time: apps are asked off this thread, a window on
+    /// its way into full screen keeping its app too busy to answer at once.
+    private func adoptFullScreenWindow() {
+        noteArrivals()
+        guard !adopting else {
+            adoptDue = true
+            return
+        }
+        adopting = true
+        Task {
+            await adopt()
+            adopting = false
+            if adoptDue {
+                adoptDue = false
+                adoptFullScreenWindow()
+            }
+        }
+    }
+
+    private func adopt() async {
+        // Out of the full screen its page asked for: from now on it goes the way any other window does.
+        // Only once it says so itself: one too busy to say is still in it.
+        let left = leftAlone
+        if !left.isEmpty {
+            let out = await apart { left.map { isOutOfFullScreen($0.window) || isGone($0.window, of: $0.pid) } }
+            let gone = zip(left, out).filter(\.1).map(\.0.window)
+            if !gone.isEmpty { leftAlone.removeAll { entry in gone.contains { CFEqual($0, entry.window) } } }
+        }
+        guard enabled, allowed, let screen = NSScreen.notched, let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != getpid(), let id = app.bundleIdentifier, !leavesOut(app) else { return }
+        let (pid, panel) = (app.processIdentifier, CGDisplayBounds(screen.displayID))
+        let found: (window: AXUIElement, id: CGWindowID)? = await apart {
+            guard let window = element(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute), isFullScreen(window),
+                  let origin = frame(of: window)?.origin, panel.contains(origin) else { return nil }
+            return (window, windowID(of: window))
+        }
+        // Things may have moved on while its app answered.
+        guard let (window, number) = found, enabled, !terminating, !missionControl, !isBusy(window),
+              let (adopt, why, cause) = verdict(on: number, of: app, panel: screen.displayID) else { return }
+        guard adopt else {
+            note("leave \(id) in its own full screen: \(why)")
+            leftAlone.append((window, pid))
+            return
+        }
+        note("adopt \(id) from its own full screen: \(why)")
+        // ⌃⌘F is this app's way into full screen, then: next time the window goes straight into true
+        // full screen on it.
+        if case .key(_, true)? = cause?.kind, !keys.contains(id) { keys.insert(id) }
         entering.append(window)
         Task {
             try? await Task.sleep(for: .milliseconds(700))
             entering.removeAll { CFEqual($0, window) }
-            await takeOver(window, pid: app.processIdentifier, sized: false)
+            await takeOver(window, pid: pid, sized: false)
         }
     }
 
-    /// What put a window of this app in full screen just now, if the window itself asked: a video's
-    /// full screen button, its F key, a game's own key. Taken out of that full screen to go into true
-    /// full screen, the window would end the video's with it, and go into true full screen without
-    /// it. Otherwise, nil: the window's own way there, which is its menu item, ⌃⌘F or 🌐F, or the
-    /// app opening it in full screen.
-    private func askedFromInside(_ pid: pid_t) -> String? {
-        let now = CFAbsoluteTimeGetCurrent()
-        let recent = clicks.inputs { $0 }.filter { now - $0.time < 3 }
-        guard let last = recent.last else { return nil }
-        let inside = { (input: Input) -> Bool in
-            if case .click(pid, 0, _) = input.kind { return true }
-            return false
-        }
-        switch last.kind {
-        case .key(let command):
-            return command ? nil : "a key pressed in it"
-        case .click:
-            if inside(last) { return "a click in it" }
-            // An item of a menu: the window's own contextual menu (a video's Full Screen), or its app's.
-            if recent.count > 1, case .click(_, _, true) = recent[recent.count - 2].kind, inside(recent[recent.count - 2]) {
-                return "its contextual menu"
-            }
-            return nil
-        }
+    /// Leaves the windows now in their apps' own full screen where they are, whatever put them there:
+    /// for when something that kept them out of true full screen is switched back on, which shouldn't
+    /// reach back for them.
+    private func settleArrivals() {
+        noteArrivals(unseen: true)
     }
 
     /// Brings a window back to the panel once it has left full screen on the stage. Its stand-in
@@ -3206,12 +3692,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// go there and keep the stage's own Mission Control out of the picture.
     fileprivate func windowsChanged() {
         guard !closing, stage != nil else { return }
+        // Not while a stand-in is on its way in or out, when windows change by the dozen: every look
+        // asks the window server, which has that way to draw, and keeps this thread waiting on it.
+        // Once it's there.
+        guard StandIn.moving == 0 else {
+            windowsDue = true
+            return
+        }
         lookForMissionControl()
         guard !checking else { return }
         // One look per burst of window changes: each asks WindowServer, which has animations to draw.
         checking = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
             checking = false
+            guard StandIn.moving == 0 else {
+                windowsDue = true
+                return
+            }
             if missionControl { return }
             refreshOpenings()
             if missionControlIsOpen() { missionControlOpened(late: true) }
@@ -3390,6 +3887,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         always.submenu = alwaysMenu()
         always.isEnabled = enabled
         menu.addItem(always)
+        let games = add("In Games", #selector(toggleGames), on: inGames, to: menu)
+        games.toolTip = "Lets games go into true full screen too. Otherwise they keep their own."
+        if !enabled { games.action = nil }
         add("Keep Ready", #selector(toggleReady), on: keepsReady, to: menu).toolTip =
             "Keeps the virtual display once it's made, so windows go into true full screen sooner."
 
@@ -3403,8 +3903,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func appsMenu() -> NSMenu {
         let menu = NSMenu()
+        let (inGames, always) = (inGames, always)
         for (id, name) in appNames(and: excluded) {
-            add(name, #selector(toggleApp), on: !excluded.contains(id), to: menu).representedObject = id
+            let entry = add(name, #selector(toggleApp), on: !excluded.contains(id), to: menu)
+            entry.representedObject = id
+            // A game is out while games are, unless it's one that's always in.
+            let url = NSRunningApplication.runningApplications(withBundleIdentifier: id).first?.bundleURL
+                ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+            guard !inGames, !always.contains(id), isGame(at: url) else { continue }
+            entry.state = .off
+            entry.action = nil
+            entry.toolTip = "A game. Check In Games for it to go into true full screen."
         }
         return menu
     }
@@ -3442,6 +3951,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         enabled.toggle()
         item.button?.image = glyph(on: enabled)
         if !enabled { targets.forEach { release($0.window) } }
+        // Back on, it leaves what went into full screen meanwhile where it is.
+        settleArrivals()
+    }
+
+    @objc private func toggleGames() {
+        inGames.toggle()
+        settleArrivals()
     }
 
     @objc private func toggleReady() {
@@ -3468,6 +3984,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleApp(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         if excluded.contains(id) { excluded.remove(id) } else { excluded.insert(id) }
+        settleArrivals()
     }
 
     @objc private func toggleLogin() {
